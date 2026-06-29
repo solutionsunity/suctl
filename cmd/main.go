@@ -30,6 +30,10 @@ import (
 )
 
 func main() {
+	// Best-effort cleanup of a leftover binary from a prior self-replace
+	// (Windows suctl.exe.old once the old process has exited). No-op on Unix.
+	installer.SweepStaleBinary()
+
 	// version — print and exit before any startup work; reporting the build
 	// version needs no bootstrap, config, logging, or module scan.
 	if len(os.Args) >= 2 && os.Args[1] == "version" {
@@ -89,6 +93,9 @@ func main() {
 			return
 		case "uninstall":
 			installer.Uninstall(os.Args[2:])
+			return
+		case "upgrade":
+			installer.Upgrade(os.Args[2:])
 			return
 		case "qc":
 			qc.Run(os.Args[2:])

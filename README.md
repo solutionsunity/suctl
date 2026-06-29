@@ -29,6 +29,25 @@ curl -fsSL https://suctl.com/install | sh
 irm https://suctl.com/install.ps1 | iex
 ```
 
+Both installers resolve the latest release, verify its sha256, and hand off to
+`suctl install` (which owns the on-disk layout). Pin a version with
+`SUCTL_VERSION=v0.5.0` or point at a fork with `SUCTL_REPO=owner/name`.
+
+## Upgrade
+
+Once installed, suctl updates itself in place — same resolve-and-verify flow as
+the installer, no script needed:
+
+```sh
+sudo suctl upgrade        # -y to skip the confirmation prompt
+```
+
+It compares the latest release against the running build, and when newer
+downloads the matching archive, verifies its checksum, swaps the binary (atomic
+on Unix; a self-rename on Windows, with the old image cleared on next run), and
+refreshes the bundled modules. Module setup/upgrade hooks run on your next
+`suctl` invocation. Honours the same `SUCTL_VERSION` / `SUCTL_REPO` overrides.
+
 ## First session
 
 ```sh
