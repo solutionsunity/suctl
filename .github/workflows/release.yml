@@ -22,7 +22,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Read version + guard against duplicate tag
         id: v
         run: |
@@ -51,7 +51,7 @@ jobs:
           - { goos: darwin,  goarch: arm64, runner: ubuntu-latest }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -81,7 +81,7 @@ jobs:
             tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
             ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: suctl-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
@@ -94,10 +94,10 @@ jobs:
     needs: [preflight, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
           merge-multiple: true
