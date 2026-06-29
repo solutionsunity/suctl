@@ -39,6 +39,8 @@ func main() {
 		"os.service.start":      func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "start") },
 		"os.service.stop":       func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "stop") },
 		"os.service.restart":    func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "restart") },
+		"os.service.survey":     cmdServiceSurvey,
+		"os.service.focus":      cmdServiceFocus,
 		"os.log.tail":           cmdLogTail,
 		"os.log.since":          cmdLogSince,
 		"os.log.search":         cmdLogSearch,

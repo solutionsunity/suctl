@@ -57,6 +57,17 @@
       "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
     },
     {
+      "name": "os.service.survey",
+      "description": "Survey suctl-registered services with live systemd active/sub state for the service surface.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.service.focus",
+      "description": "Focus view for one registered service: full systemd state plus state-valid actions.",
+      "async": false,
+      "params": [{"name": "subject", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
       "name": "os.log.tail",
       "description": "Tail the last N log lines for a service from journald or a file.",
       "async": false,

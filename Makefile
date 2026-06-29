@@ -94,6 +94,7 @@ mod-os:
 	@mkdir -p $(BIN)/modules/suctl-mod-os
 	cd modules/suctl-mod-os && $(GO) build -o ../../$(BIN)/modules/suctl-mod-os/suctl-mod-os$(EXE) .
 	cp modules/suctl-mod-os/manifest.json $(BIN)/modules/suctl-mod-os/
+	cp modules/suctl-mod-os/surface.json  $(BIN)/modules/suctl-mod-os/
 
 
 

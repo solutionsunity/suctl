@@ -1,0 +1,26 @@
+{
+  "surfaces": [
+    {
+      "subject": "service",
+      "desc": "all systemd services on the host — live active/sub state, tagged managed (registered for suctl) or unmanaged, with register / start / stop / restart.",
+      "survey": {
+        "entry": "os.service.survey",
+        "columns": [
+          { "id": "active",  "label": "active" },
+          { "id": "sub",     "label": "sub" },
+          { "id": "managed", "label": "managed" }
+        ],
+        "facets": [
+          { "label": "active",    "value": "active"    },
+          { "label": "inactive",  "value": "inactive"  },
+          { "label": "failed",    "value": "failed"    },
+          { "label": "managed",   "value": "managed"   },
+          { "label": "unmanaged", "value": "unmanaged" }
+        ]
+      },
+      "focus": {
+        "entry": "os.service.focus"
+      }
+    }
+  ]
+}
