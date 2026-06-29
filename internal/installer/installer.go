@@ -86,6 +86,15 @@ func Run(args []string) {
 	must(os.WriteFile(paths.SuctlBin, data, 0755), "write suctl binary")
 	step("%s", paths.SuctlBin)
 
+	// Ensure the install directory is on PATH so `suctl` is runnable from any
+	// shell. No-op on Unix (/usr/local/bin is already on PATH); on Windows this
+	// adds %ProgramData%\suctl\bin to the machine PATH.
+	changed, err := registerPath()
+	must(err, "add "+paths.BinDir+" to PATH")
+	if changed {
+		step("added %s to PATH (open a new terminal to use suctl)", paths.BinDir)
+	}
+
 	// 2. Install whatever suctl-shipped modules sit next to the binary into the
 	//    system module directory. Every subdirectory under modules/ is a module;
 	//    the set is decided once at build time (Makefile), so this path copies
@@ -156,6 +165,15 @@ func Uninstall(args []string) {
 
 	removeDir(paths.SystemModulePath)
 	removeFile(paths.SuctlBin)
+
+	// Reverse the PATH entry added by install. No-op on Unix; best-effort on
+	// Windows — a stale entry pointing at a removed dir is harmless, so a
+	// failure here is reported but does not abort the uninstall.
+	if changed, err := unregisterPath(); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s  remove %s from PATH: %v\n", theme.Error.Render("✗"), paths.BinDir, err)
+	} else if changed {
+		step("removed %s from PATH", paths.BinDir)
+	}
 
 	if !*purge {
 		fmt.Println()
