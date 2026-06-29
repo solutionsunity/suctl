@@ -1,0 +1,44 @@
+{
+  "surfaces": [
+    {
+      "subject": "jail",
+      "survey": {
+        "entry": "fail2ban.jail.survey",
+        "columns": [
+          { "id": "filter",   "label": "filter" },
+          { "id": "banned",   "label": "banned",   "align": "right" },
+          { "id": "status",   "label": "status" },
+          { "id": "bantime",  "label": "bantime",  "align": "right" },
+          { "id": "findtime", "label": "findtime", "align": "right" },
+          { "id": "maxretry", "label": "maxretry", "align": "right" }
+        ],
+        "facets": [
+          { "label": "active",     "value": "active"     },
+          { "label": "inactive",   "value": "inactive"   },
+          { "label": "available",  "value": "available"  },
+          { "label": "managed",    "value": "managed"    },
+          { "label": "foreign",    "value": "foreign"    },
+          { "label": "conflict",   "value": "conflict"   },
+          { "label": "overridden", "value": "overridden" }
+        ]
+      },
+      "focus": {
+        "entry": "fail2ban.jail.focus"
+      }
+    },
+    {
+      "subject": "banned_ip",
+      "survey": {
+        "entry": "fail2ban.banned_ip.survey",
+        "columns": [
+          { "id": "ip",     "label": "ip" },
+          { "id": "jail",   "label": "jail" },
+          { "id": "banned", "label": "banned", "align": "right" }
+        ]
+      },
+      "focus": {
+        "entry": "fail2ban.banned_ip.focus"
+      }
+    }
+  ]
+}

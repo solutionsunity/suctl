@@ -1,0 +1,247 @@
+{
+  "version": "0.2.0",
+  "protocol": "1",
+  "platform": ["linux"],
+  "author": "suctl",
+  "license": "Apache-2.0",
+  "entrypoint": "suctl-mod-odoo",
+  "description": "Manages Odoo modules, databases, and users. Uses the service-attached pattern: pre-activate installs suctl-odoo-service into Odoo's systemd unit via ExecStartPost.",
+  "requires": {
+    "binaries": ["systemctl"],
+    "paths": ["/etc/odoo/odoo.conf"],
+    "sockets": [],
+    "permissions": [],
+    "capabilities": [],
+    "config": []
+  },
+  "hooks": {
+    "pre-activate": {
+      "exec": "hooks/pre-activate.sh",
+      "timeout_seconds": 120
+    },
+    "on-start": {
+      "exec": "hooks/on-start.py",
+      "timeout_seconds": 150
+    },
+    "post-deactivate": {
+      "exec": "hooks/post-deactivate.sh",
+      "timeout_seconds": 60
+    }
+  },
+  "capabilities": [
+    {
+      "name": "odoo.module.list",
+      "description": "List installed and available Odoo modules.",
+      "async": false,
+      "params": [
+        {"name": "db", "type": "string", "required": false, "description": "Database name (omit for default)"}
+      ]
+    },
+    {
+      "name": "odoo.module.install",
+      "description": "Install an Odoo module by technical name.",
+      "async": true,
+      "params": [
+        {"name": "module", "type": "string", "required": true, "description": "Technical module name"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.module.upgrade",
+      "description": "Upgrade a specific Odoo module.",
+      "async": true,
+      "params": [
+        {"name": "module", "type": "string", "required": true, "description": "Technical module name"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.module.upgrade-all",
+      "description": "Upgrade all installed Odoo modules in a database. When invoked from the module survey action bar, receives {scope, subjects[]} and upgrades all installed modules in the database regardless of the visible subject set.",
+      "async": true,
+      "params": [
+        {"name": "db",       "type": "string", "required": false, "description": "Database name (direct CLI invocation)"},
+        {"name": "scope",    "type": "string", "required": false, "description": "Database name (survey action invocation)"},
+        {"name": "subjects", "type": "array",  "required": false, "description": "Visible subject ids (ignored — all installed modules are upgraded)"}
+      ]
+    },
+    {
+      "name": "odoo.module.upgrade-selected",
+      "description": "Upgrade the specified subset of Odoo modules in a database. Invoked from the module survey action bar; receives {scope, subjects[]} where subjects are the currently visible composite 'db/module' ids (e.g. after activating the upgradable facet).",
+      "async": true,
+      "params": [
+        {"name": "scope",    "type": "string", "required": true,  "description": "Database name (injected by core from the survey scope)"},
+        {"name": "subjects", "type": "array",  "required": true,  "description": "Composite 'db/module' ids of the modules to upgrade"}
+      ]
+    },
+    {
+      "name": "odoo.module.uninstall",
+      "description": "Uninstall an Odoo module by technical name.",
+      "async": true,
+      "params": [
+        {"name": "module", "type": "string", "required": true, "description": "Technical module name"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.module.detect-changes",
+      "description": "Detect and apply file-level module changes (i18n, views, data).",
+      "async": true,
+      "params": [
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.module.force-update-data",
+      "description": "Force reload of all data XML/CSV files for a module.",
+      "async": true,
+      "params": [
+        {"name": "module", "type": "string", "required": true, "description": "Technical module name"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.database.survey",
+      "description": "Render the database landscape survey (list of all Odoo databases on this instance).",
+      "async": true,
+      "params": []
+    },
+    {
+      "name": "odoo.database.focus",
+      "description": "Render the focus view for a selected Odoo database (module and user counts).",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.database.overview",
+      "description": "Whole-column data source for the database survey: returns the modules (installed/total), users (active/total) and upgrade-drift status as a row-keyed column-map for every database in one call. Host-wide — one server.verdict gives the drift for all databases (fingerprint matrix computed once); module/user counts are read per database. Async — fills the three survey columns of every row progressively.",
+      "async": true,
+      "params": []
+    },
+    {
+      "name": "odoo.module.survey",
+      "description": "Render the module landscape survey for a database (all modules with status and version, each tagged with applicable facets).",
+      "async": false,
+      "params": [
+        {"name": "scope", "type": "string", "required": true, "description": "Database name (injected by core from the selected database row)"}
+      ]
+    },
+    {
+      "name": "odoo.module.focus",
+      "description": "Render the focus view for a selected Odoo module. Subject is a composite 'db/module' id.",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Composite id: '<database>/<technical_module_name>'"}
+      ]
+    },
+    {
+      "name": "odoo.user.survey",
+      "description": "Render the user landscape survey for a database (all internal users with login and status, each tagged with applicable facets).",
+      "async": false,
+      "params": [
+        {"name": "scope", "type": "string", "required": true, "description": "Database name (injected by core from the selected database row)"}
+      ]
+    },
+    {
+      "name": "odoo.user.focus",
+      "description": "Render the focus view for a selected Odoo user. Subject is a composite 'db/login' id.",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Composite id: '<database>/<user_login>'"}
+      ]
+    },
+    {
+      "name": "odoo.db.list",
+      "description": "List all Odoo databases on this instance.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "odoo.db.create",
+      "description": "Create a new Odoo database.",
+      "async": true,
+      "params": [
+        {"name": "db", "type": "string", "required": true, "description": "New database name"},
+        {"name": "demo", "type": "string", "required": false, "description": "Load demo data (true/false, default false)"}
+      ]
+    },
+    {
+      "name": "odoo.db.duplicate",
+      "description": "Duplicate an existing Odoo database.",
+      "async": true,
+      "params": [
+        {"name": "source", "type": "string", "required": true, "description": "Source database name"},
+        {"name": "dest", "type": "string", "required": true, "description": "Destination database name"}
+      ]
+    },
+    {
+      "name": "odoo.user.list",
+      "description": "List Odoo users.",
+      "async": false,
+      "params": [
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.user.reset-password",
+      "description": "Set a new password for an Odoo user directly via the ORM. Bypasses email-based reset — intended for operator recovery scenarios.",
+      "async": false,
+      "params": [
+        {"name": "login", "type": "string", "required": true, "description": "User login (email)"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.user.activate",
+      "description": "Activate (unarchive) an Odoo user account.",
+      "async": false,
+      "params": [
+        {"name": "login", "type": "string", "required": true, "description": "User login (email)"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.user.deactivate",
+      "description": "Deactivate (archive) an Odoo user account.",
+      "async": false,
+      "params": [
+        {"name": "login", "type": "string", "required": true, "description": "User login (email)"},
+        {"name": "db", "type": "string", "required": false, "description": "Database name"}
+      ]
+    },
+    {
+      "name": "odoo.server.survey",
+      "description": "Render the server card: a single 'server' subject showing Odoo service reachability and loaded-code restart state. The host-wide upgrade-drift breakdown is deferred to focus.",
+      "async": true,
+      "params": []
+    },
+    {
+      "name": "odoo.server.focus",
+      "description": "Render the server detail card: service status, loaded-code (restart) anchor, and the host-wide upgrade-drift breakdown (computed on drill).",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "The server subject id (always 'server')"}
+      ]
+    },
+    {
+      "name": "odoo.server.upgrade-drifted",
+      "description": "Upgrade every installed module whose on-disk content drifted from its database stamp, across all databases (server survey 'auto upgrade' action). Surface-triggered: requires the visible 'subjects' set; an empty invoke is rejected with INVALID_PARAMS and performs no work.",
+      "async": true,
+      "params": [
+        {"name": "scope",    "type": "string", "required": false, "description": "Unused — the action is host-wide (injected empty by core for top-level surfaces)"},
+        {"name": "subjects", "type": "array",  "required": true,  "description": "Visible server-survey subject ids; gates execution (proof of a real surface trigger). The upgrade itself is host-wide."}
+      ]
+    },
+    {
+      "name": "odoo.server.restart-service",
+      "description": "Restart the Odoo service to re-anchor loaded code (clears needs-restart). Host-wide; runs from the suctl side via systemctl. Surface-triggered: requires the visible 'subjects' set; an empty invoke is rejected with INVALID_PARAMS and performs no restart.",
+      "async": true,
+      "params": [
+        {"name": "scope",    "type": "string", "required": false, "description": "Unused — the action is host-wide"},
+        {"name": "subjects", "type": "array",  "required": true,  "description": "Visible server-survey subject ids; gates execution (proof of a real surface trigger). The restart is host-wide."}
+      ]
+    }
+  ]
+}

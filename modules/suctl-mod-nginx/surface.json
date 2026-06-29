@@ -1,0 +1,72 @@
+{
+  "surfaces": [
+    {
+      "subject": "domain",
+      "survey": {
+        "entry": "nginx.domain.survey",
+        "columns": [
+          { "id": "blocks", "label": "names" },
+          { "id": "dns",    "label": "dns" },
+          { "id": "ssl",    "label": "ssl" },
+          { "id": "status", "label": "status" }
+        ],
+        "facets": [
+          { "label": "active",        "value": "active"       },
+          { "label": "suspended",     "value": "suspended"    },
+          { "label": "maintenance",   "value": "maintenance"  },
+          { "label": "conflict",      "value": "conflict"     },
+          { "label": "in default",    "value": "in-default"   },
+          { "label": "ssl: valid",    "value": "ssl:valid"    },
+          { "label": "ssl: expiring", "value": "ssl:expiring" },
+          { "label": "ssl: expired",  "value": "ssl:expired"  },
+          { "label": "ssl: none",     "value": "ssl:none"     }
+        ]
+      },
+      "focus": {
+        "entry": "nginx.domain.focus"
+      }
+    },
+    {
+      "subject": "source",
+      "name": "source",
+      "desc": "nginx config files under sites-available. The default file's blocks can be migrated into their own per-domain files.",
+      "survey": {
+        "entry": "nginx.source.survey",
+        "columns": [
+          { "id": "blocks",  "label": "blocks",     "align": "right" },
+          { "id": "managed", "label": "managed" },
+          { "id": "enabled", "label": "enabled" },
+          { "id": "migrate", "label": "to migrate", "align": "right" }
+        ],
+        "facets": [
+          { "label": "default",    "value": "default"    },
+          { "label": "to migrate", "value": "to-migrate" },
+          { "label": "managed",    "value": "managed"    },
+          { "label": "foreign",    "value": "foreign"    },
+          { "label": "enabled",    "value": "enabled"    },
+          { "label": "disabled",   "value": "disabled"   }
+        ]
+      },
+      "focus": {
+        "entry": "nginx.source.focus"
+      },
+      "drills": [
+        {
+          "subject": "block",
+          "label": "blocks",
+          "survey": {
+            "entry": "nginx.block.survey",
+            "columns": [
+              { "id": "names", "label": "server_names" },
+              { "id": "role",  "label": "role" },
+              { "id": "ssl",   "label": "ssl" }
+            ]
+          },
+          "focus": {
+            "entry": "nginx.domain.focus"
+          }
+        }
+      ]
+    }
+  ]
+}

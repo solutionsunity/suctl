@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""
+suctl-mod-fail2ban — suctl module for managing fail2ban jails and bans.
+
+Speaks the suctl module protocol v1 over the inherited SUCTL_BROKER_FD wire via
+the shared suctlmod SDK. Two boundaries live here:
+
+  • the fail2ban server, addressed directly over its Unix socket with the native
+    pickle protocol — live state (jail/ban status), runtime bans (ban/unban), and
+    every change the server can apply itself (set tunables/ignoreip, stop a jail);
+    and
+  • the on-disk config, where jails are created/tuned through highest-precedence
+    jail.d/<name>.local drop-ins — jail.local is never read or written.
+
+The fail2ban server is config-agnostic: it never reads /etc/fail2ban itself — the
+stock client parses the config tree and streams it. So the one exception to the
+socket-only rule is activating a jail (loading a brand-new jail's full
+filter/action config into the running server), which shells out to
+`fail2ban-client reload <jail>` to reuse fail2ban's own parser.
+
+suctl is the operator's hand: any jail may be operated on. A "# suctl-managed"
+marker on a drop-in is attribution only (certbot-style), not a restriction.
+
+Why Python (not Go): the fail2ban server is itself Python and speaks its native
+pickle protocol on the socket — here it is stdlib pickle.dumps/loads, byte-for-
+byte what the server expects. Go has no stdlib pickle, so it would mean hand-
+rolling the pickle wire format or scraping fail2ban-client text output; Python is
+the low-effort, high-fidelity client. (Go remains right for the file/exec/systemd
+modules.)
+"""
+
+import glob
+import json
+import os
+import pickle
+import shutil
+import socket
+import subprocess
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Prefer a vendored suctlmod (staged alongside this entrypoint); fall back to the
+# repo SDK at sdk/python for in-tree/dev runs (e.g. BIST on the source dir).
+for _p in (_HERE, os.path.join(_HERE, '..', '..', 'sdk', 'python')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import suctlmod
+
+MANIFEST_PATH = os.path.join(_HERE, 'manifest.json')
+CATALOG_PATH  = os.path.join(_HERE, 'catalog.json')
+ASSET_FILTER_D = os.path.join(_HERE, 'filter.d')
+LOG_FILE      = '/var/log/suctl/suctl-mod-fail2ban.log'
+
+ETC      = '/etc/fail2ban'
+JAIL_D   = os.path.join(ETC, 'jail.d')
+FILTER_D = os.path.join(ETC, 'filter.d')
+
+MARKER   = '# suctl-managed'
+TUNABLES = ('maxretry', 'bantime', 'findtime')
+
+# fail2ban server socket — /run is canonical; /var/run is the legacy symlink.
+SOCK_PATHS  = ('/run/fail2ban/fail2ban.sock', '/var/run/fail2ban/fail2ban.sock')
+F2B_END     = b'<F2B_END_COMMAND>'
+F2B_CLOSE   = b'<F2B_CLOSE_COMMAND>'
+F2B_TIMEOUT = 10  # seconds
+
+# fail2ban-client: the server is config-agnostic (it never reads /etc/fail2ban),
+# so loading a brand-new jail's full config into the running server is delegated
+# to the stock client, which parses the config tree and streams it. Every other
+# change is applied directly over the socket above.
+F2B_CLIENT     = 'fail2ban-client'
+CLIENT_TIMEOUT = 30  # seconds
+
+
+# ── fail2ban server socket (native pickle protocol) ───────────────────────────
+# Mirrors fail2ban.client.csocket: pickle the string command list, terminate
+# with F2B_END, read until F2B_END, unpickle the (code, result) reply. code 0 is
+# success; any other code carries the server-side failure in result.
+
+class F2BError(Exception):
+    """The fail2ban server was unreachable or returned a failure."""
+
+
+def _f2b_conv(m):
+    """Mirror CSocket.convert: pass primitives through, stringify the rest."""
+    if isinstance(m, (str, bool, int, float, list, dict, set)):
+        return m
+    return str(m)
+
+
+def _f2b_one(path, args):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(F2B_TIMEOUT)
+    try:
+        sock.connect(path)
+        sock.sendall(pickle.dumps([_f2b_conv(a) for a in args], pickle.HIGHEST_PROTOCOL))
+        sock.sendall(F2B_END)
+        buf = b''
+        while buf.rfind(F2B_END, -32) == -1:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise F2BError('fail2ban server closed connection without a reply')
+            buf += chunk
+        code, result = pickle.loads(buf)
+    finally:
+        try:
+            sock.sendall(F2B_CLOSE + F2B_END)
+        except OSError:
+            pass
+        sock.close()
+    if code != 0:
+        raise F2BError(str(result))
+    return result
+
+
+def f2b(*args):
+    """Run one command against the fail2ban server, trying each socket path in
+    turn. Raises F2BError if no socket is reachable or the command fails."""
+    last = 'fail2ban socket not present — is fail2ban running?'
+    for path in SOCK_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            return _f2b_one(path, args)
+        except (OSError, pickle.PickleError) as exc:
+            last = f'fail2ban socket error ({path}): {exc}'
+        except F2BError as exc:
+            raise exc
+    raise F2BError(last)
+
+
+# ── Catalog (creatable jails + their defaults) ────────────────────────────────
+
+def _load_catalog():
+    try:
+        with open(CATALOG_PATH) as f:
+            return json.load(f).get('jails', [])
+    except Exception:
+        return []
+
+CATALOG = _load_catalog()
+CATALOG_BY_NAME = {j.get('name', ''): j for j in CATALOG}
+
+
+# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def _arg(args, *keys):
+    """First non-empty string among keys (focus/inline actions pass the row id as
+    'subject'; direct calls pass the named param). None when absent."""
+    for k in keys:
+        v = (args or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _require(args, named):
+    """Resolve a required jail/ip-style param from its name or 'subject'."""
+    v = _arg(args, named, 'subject')
+    if v is None:
+        raise suctlmod.CapError('INVALID_PARAMS', f'{named} is required')
+    return v
+
+
+# ── jail.d drop-ins (operator's hand; never jail.local) ───────────────────────
+# A managed jail is a jail.d/<name>.local we wrote, tagged with MARKER. The
+# render order is fixed so rewrites are stable; enabled=None omits the line so a
+# tunable change on a foreign jail never silently disables it.
+
+_ORDER = ('filter', 'backend', 'logpath', 'port',
+          'maxretry', 'bantime', 'findtime', 'ignoreip')
+# Params whose provenance we surface across the cascade (precedence view).
+# 'enabled' leads because its layering is what most often surprises operators.
+_CASCADE_PARAMS = ('enabled',) + _ORDER
+
+
+def _dropin_path(name):
+    return os.path.join(JAIL_D, name + '.local')
+
+
+def _read_dropin(name):
+    """Parse our jail.d/<name>.local into a flat dict (lowercased keys) plus
+    '_marker'; None when the file is absent or unreadable."""
+    path = _dropin_path(name)
+    if not os.path.exists(path):
+        return None
+    d = {'_marker': False}
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith('#'):
+                    if MARKER in line:
+                        d['_marker'] = True
+                    continue
+                if line.startswith('[') and line.endswith(']'):
+                    continue
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    d[k.strip().lower()] = v.strip()
+    except OSError:
+        return None
+    return d
+
+
+def _effective_enabled(records):
+    """Tri-state effective 'enabled' across the per-jail cascade: True/False, or
+    None when no per-jail section sets it (only [DEFAULT] governs). A managed
+    drop-in stamps this so its run state is self-contained and stable —
+    unchanged if the operator later removes a lower-precedence file. (Defined
+    via the cascade helpers below; called only at runtime.)"""
+    v, _f = _effective(records, 'enabled')
+    if v is None:
+        return None
+    return str(v).strip().lower() == 'true'
+
+
+def _enabled_override_note(records, asserted, jail):
+    """When a lower-precedence file sets 'enabled' opposite to what our drop-in
+    now asserts, return a note naming the file(s). suctl wins at runtime and does
+    not edit foreign files — cleaning them is the operator's job."""
+    ours = _dropin_path(jail)
+    want = 'true' if asserted else 'false'
+    clashes = [f'{v} ({_short(f)})'
+               for (_t, f, v) in _param_layers(records, 'enabled')
+               if f != ours and str(v).strip().lower() != want]
+    if not clashes:
+        return None
+    return ('overriding enabled in lower-precedence file(s): '
+            + '; '.join(clashes)
+            + ' — suctl wins at runtime; clean them manually if undesired')
+
+
+def _write_dropin(name, settings, enabled):
+    os.makedirs(JAIL_D, exist_ok=True)
+    lines = [MARKER, f'[{name}]']
+    if enabled is not None:
+        lines.append(f'enabled = {"true" if enabled else "false"}')
+    for k in _ORDER:
+        v = settings.get(k)
+        if v is None or v == '':
+            continue
+        lines.append(f'{k} = {v}')
+    tmp = _dropin_path(name) + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, _dropin_path(name))
+
+
+def _managed_names():
+    return [os.path.splitext(os.path.basename(p))[0]
+            for p in glob.glob(os.path.join(JAIL_D, '*.local'))]
+
+
+# fail2ban resolves jails by reading, in increasing precedence:
+#   jail.conf → jail.d/*.conf → jail.local → jail.d/*.local
+# Enumerating the [section] names across that cascade lets the surfaces see every
+# defined jail (stock or ours, active or not), not just our drop-ins. jail.local
+# is read for discovery only; it is never written.
+_SKIP_SECTIONS = ('DEFAULT', 'INCLUDES', 'Definition', 'Init')
+
+
+def _cascade_files():
+    files = [os.path.join(ETC, 'jail.conf')]
+    files += sorted(glob.glob(os.path.join(JAIL_D, '*.conf')))
+    files.append(os.path.join(ETC, 'jail.local'))
+    files += sorted(glob.glob(os.path.join(JAIL_D, '*.local')))
+    return files
+
+
+def _file_tier(path):
+    """Precedence tier of a cascade file (higher wins): jail.conf(0) <
+    jail.d/*.conf(1) < jail.local(2) < jail.d/*.local(3). Files in the same tier
+    are read in filename order, so two of them setting one param is a silent,
+    order-dependent conflict — the only error-grade ambiguity in the cascade."""
+    base = os.path.basename(path)
+    if base == 'jail.conf':
+        return 0
+    if base == 'jail.local':
+        return 2
+    if path.endswith('.local'):
+        return 3
+    return 1
+
+
+def _short(path):
+    """Friendly cascade-relative name for a config file (e.g. jail.d/x.local)."""
+    base = os.path.basename(path)
+    return 'jail.d/' + base if os.path.dirname(path) == JAIL_D else base
+
+
+def _cascade_jails():
+    """Per-jail provenance across the cascade. Returns name → list of
+    (tier, file, param, value) records in increasing-precedence order, so the
+    last record for a given param is the effective one. jail.local is read for
+    discovery only; it is never written. [DEFAULT]/INCLUDES are skipped — they
+    are global baseline, not per-jail provenance."""
+    found = {}
+    for path in _cascade_files():
+        if not os.path.exists(path):
+            continue
+        tier = _file_tier(path)
+        cur = None
+        try:
+            with open(path) as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line[0] in '#;':
+                        continue
+                    if line.startswith('[') and line.endswith(']'):
+                        cur = line[1:-1].strip()
+                        if cur in _SKIP_SECTIONS:
+                            cur = None
+                        else:
+                            found.setdefault(cur, [])
+                        continue
+                    if cur is None or '=' not in line:
+                        continue
+                    k, _, v = line.partition('=')
+                    found[cur].append((tier, path, k.strip().lower(), v.strip()))
+        except OSError:
+            continue
+    return found
+
+
+def _param_layers(records, param):
+    """All (tier, file, value) for one param, in increasing-precedence order."""
+    return [(t, f, v) for (t, f, k, v) in records if k == param]
+
+
+def _effective(records, param):
+    """(value, file) of the highest-precedence definition of param across the
+    cascade, or (None, None) when it is set nowhere in a per-jail section."""
+    layers = _param_layers(records, param)
+    if not layers:
+        return None, None
+    _, f, v = layers[-1]
+    return v, f
+
+
+def _param_conflict(records, param):
+    """True when two files of the same tier set param to differing values —
+    fail2ban breaks that tie by filename order, a silent surprise."""
+    by_tier = {}
+    for t, _f, v in _param_layers(records, param):
+        by_tier.setdefault(t, []).append(v)
+    return any(len(vs) > 1 and len(set(vs)) > 1 for vs in by_tier.values())
+
+
+def _jail_conflict(records):
+    """Any same-tier conflict on a tracked param — error-grade ambiguity."""
+    return any(_param_conflict(records, p) for p in _CASCADE_PARAMS)
+
+
+def _jail_overridden(records):
+    """Any tracked param set in more than one tier (a higher layer shadows a
+    lower one) — normal, deterministic layering, surfaced for insight."""
+    for p in _CASCADE_PARAMS:
+        tiers = {t for (t, _f, _v) in _param_layers(records, p)}
+        if len(tiers) > 1:
+            return True
+    return False
+
+
+def _provenance_fields(records):
+    """Focus fields showing, per tracked param, the effective value and its
+    source file, the lower-precedence definitions it shadows, and whether
+    same-tier files disagree (conflict)."""
+    fields = []
+    for p in _CASCADE_PARAMS:
+        layers = _param_layers(records, p)
+        if not layers:
+            continue
+        _, eff_f, eff_v = layers[-1]
+        conflict = _param_conflict(records, p)
+        detail = f'{eff_v}  ({_short(eff_f)})'
+        if len(layers) > 1:
+            shadow = '; '.join(f'{v} ({_short(f)})' for (_t, f, v) in layers[:-1])
+            detail += f'  \u2190 shadows {shadow}'
+        if conflict:
+            detail += '  [same-tier conflict]'
+        color = 'err' if conflict else ('warn' if len(layers) > 1 else None)
+        fields.append(suctlmod.surface.field(p, detail, color=color))
+    return fields
+
+
+def _client_reload_jail(jail):
+    """Load/refresh a jail in the running server via the stock client, which
+    parses the on-disk config and streams it (the server cannot read config
+    itself). On failure the drop-in persists but the live jail was not loaded —
+    the client's stderr is surfaced verbatim.
+
+    --if-exists is required for first-time activation: plain `reload <jail>`
+    makes the server look the jail up before applying the stream, so a brand-new
+    jail (not yet loaded) raises 'jail does not exist'. With --if-exists the
+    server skips that lookup; the streamed add/set/start then loads it. An
+    already-loaded jail still reloads normally."""
+    exe = shutil.which(F2B_CLIENT) or '/usr/bin/' + F2B_CLIENT
+    try:
+        r = subprocess.run([exe, 'reload', '--if-exists', jail],
+                           capture_output=True, text=True, timeout=CLIENT_TIMEOUT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise suctlmod.CapError(
+            'CALLABLE_FAILED',
+            f'activate: config written but {F2B_CLIENT} reload failed — {exc}')
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or '').strip() or f'exit {r.returncode}'
+        raise suctlmod.CapError(
+            'CALLABLE_FAILED',
+            f'activate: config written but {F2B_CLIENT} reload failed — {msg}')
+
+
+def jail_create(jail):
+    entry = CATALOG_BY_NAME.get(jail)
+    if entry is None:
+        raise suctlmod.CapError(
+            'INVALID_PARAMS', f'unknown catalog jail: {jail} (see fail2ban.catalog.list)')
+    if os.path.exists(_dropin_path(jail)):
+        raise suctlmod.CapError('CALLABLE_FAILED', f'jail already exists: {jail}')
+    src = os.path.join(ASSET_FILTER_D, entry['filter'] + '.conf')
+    if not os.path.exists(src):
+        raise suctlmod.CapError('CALLABLE_FAILED', f'filter asset missing: {entry["filter"]}.conf')
+    os.makedirs(FILTER_D, exist_ok=True)
+    shutil.copyfile(src, os.path.join(FILTER_D, entry['filter'] + '.conf'))
+    settings = {k: entry.get(k) for k in _ORDER}
+    settings['filter'] = entry.get('filter', jail)
+    _write_dropin(jail, settings, enabled=False)
+    return {'created': jail, 'enabled': False}
+
+
+def jail_delete(jail):
+    di = _read_dropin(jail)
+    if di is None:
+        raise suctlmod.CapError('CALLABLE_FAILED', f'no jail.d drop-in for: {jail}')
+    os.remove(_dropin_path(jail))
+    entry = CATALOG_BY_NAME.get(jail)
+    filt = di.get('filter')
+    if entry and filt:
+        fp = os.path.join(FILTER_D, filt + '.conf')
+        try:
+            os.remove(fp)
+        except OSError:
+            pass
+    try:
+        f2b('stop', jail)  # best-effort live stop; the jail is already off disk
+    except F2BError:
+        pass
+    return {'deleted': jail}
+
+
+def jail_activate(jail):
+    """Assert enabled=true in suctl's drop-in (the authoritative top tier), then
+    load the jail into the running server. The server cannot read config itself,
+    so a freshly-created jail is loaded via the stock client (which parses and
+    streams the full filter/action config). We never edit foreign files; a
+    lower-tier enabled=false is overridden at runtime and surfaced as a note."""
+    records = _cascade_jails().get(jail, [])
+    di = _read_dropin(jail)
+    settings = {k: (di or {}).get(k) for k in _ORDER}
+    _write_dropin(jail, settings, enabled=True)
+    _client_reload_jail(jail)
+    out = {jail: 'enabled'}
+    note = _enabled_override_note(records, True, jail)
+    if note:
+        out['note'] = note
+    return out
+
+
+def jail_deactivate(jail):
+    """Disable the jail by asserting enabled=false in suctl's drop-in (the
+    authoritative top tier), then stop it over the socket. We never edit foreign
+    files: a lower-tier enabled=true is overridden at runtime and surfaced as a
+    note for the operator to clean. An already-stopped jail is a no-op success."""
+    records = _cascade_jails().get(jail, [])
+    di = _read_dropin(jail)
+    settings = {k: (di or {}).get(k) for k in _ORDER}
+    _write_dropin(jail, settings, enabled=False)
+    if _server_has_jail(jail):
+        try:
+            f2b('stop', jail)
+        except F2BError as exc:
+            raise suctlmod.CapError(
+                'CALLABLE_FAILED',
+                f'deactivate: config written but fail2ban stop failed — {exc}')
+    out = {jail: 'disabled'}
+    note = _enabled_override_note(records, False, jail)
+    if note:
+        out['note'] = note
+    return out
+
+
+def jail_set(jail, param, value):
+    if param not in TUNABLES:
+        raise suctlmod.CapError('INVALID_PARAMS',
+                                f'unknown tunable: {param} (allowed: {", ".join(TUNABLES)})')
+    di = _read_dropin(jail)
+    records = _cascade_jails().get(jail, [])
+    settings = {k: (di or {}).get(k) for k in _ORDER}
+    settings[param] = value
+    # Stamp the cascade-effective enabled so the drop-in is self-contained — this
+    # never flips run state (same effective value), it just makes it explicit.
+    _write_dropin(jail, settings, _effective_enabled(records))
+    # The setter is a direct server command — apply live only when the jail is
+    # loaded; otherwise the drop-in alone carries the value until activation.
+    if _server_has_jail(jail):
+        try:
+            f2b('set', jail, param, value)
+        except F2BError as exc:
+            raise suctlmod.CapError(
+                'CALLABLE_FAILED',
+                f'set {param}: config written but live apply failed — {exc}')
+    return {jail: {param: value}}
+
+
+def _ignoreip_list(di):
+    raw = (di or {}).get('ignoreip', '')
+    return [x for x in raw.replace(',', ' ').split() if x]
+
+
+def ignoreip_change(jail, ip, add):
+    di = _read_dropin(jail)
+    records = _cascade_jails().get(jail, [])
+    ips = _ignoreip_list(di)
+    if add and ip not in ips:
+        ips.append(ip)
+    elif not add and ip in ips:
+        ips.remove(ip)
+    settings = {k: (di or {}).get(k) for k in _ORDER}
+    settings['ignoreip'] = ' '.join(ips)
+    # Stamp the cascade-effective enabled so the drop-in is self-contained.
+    _write_dropin(jail, settings, _effective_enabled(records))
+    # addignoreip/delignoreip are direct server commands — apply live only when
+    # the jail is loaded; the drop-in carries the change otherwise.
+    if _server_has_jail(jail):
+        cmd = 'addignoreip' if add else 'delignoreip'
+        try:
+            f2b('set', jail, cmd, ip)
+        except F2BError as exc:
+            raise suctlmod.CapError(
+                'CALLABLE_FAILED',
+                f'ignoreip.{"add" if add else "remove"}: '
+                f'config written but live apply failed — {exc}')
+    return {jail: {'ignoreip': ips}}
+
+
+# ── Live status (fail2ban server) ─────────────────────────────────────────────
+
+def _pairs(res):
+    return res if isinstance(res, (list, tuple)) else []
+
+
+def _server_jails():
+    """Live jail names from the running server; raises F2BError if unreachable."""
+    for k, v in _pairs(f2b('status')):
+        if isinstance(k, str) and k.lower().startswith('jail list'):
+            return [x.strip() for x in str(v).split(',') if x.strip()]
+    return []
+
+
+def _server_has_jail(name):
+    """True when the jail is currently loaded in the running server. False when
+    it is absent or the server is unreachable — callers use this to decide
+    whether a live (socket) apply is possible; the on-disk drop-in is the
+    durable record either way."""
+    try:
+        return name in _server_jails()
+    except F2BError:
+        return False
+
+
+def _jail_status(name):
+    out = {'currently_banned': 0, 'total_banned': 0,
+           'currently_failed': 0, 'total_failed': 0,
+           'banned': [], 'file_list': []}
+    for k, v in _pairs(f2b('status', name)):
+        if k == 'Filter':
+            for fk, fv in _pairs(v):
+                if fk == 'Currently failed':
+                    out['currently_failed'] = fv
+                elif fk == 'Total failed':
+                    out['total_failed'] = fv
+                elif fk == 'File list':
+                    out['file_list'] = fv
+        elif k == 'Actions':
+            for ak, av in _pairs(v):
+                if ak == 'Currently banned':
+                    out['currently_banned'] = av
+                elif ak == 'Total banned':
+                    out['total_banned'] = av
+                elif ak == 'Banned IP list':
+                    out['banned'] = av
+    return out
+
+
+# ── jail surface ──────────────────────────────────────────────────────────────
+
+def _collect_jails():
+    """Union of live jails, on-disk defined jails (whole cascade), and managed
+    drop-ins, each annotated with cascade provenance. Degrades to the
+    disk-defined set (all inactive, unknown ban counts) when the server is
+    down."""
+    live = []
+    try:
+        live = _server_jails()
+    except F2BError:
+        pass
+    cascade = _cascade_jails()
+    rows = []
+    for name in sorted(set(live) | set(_managed_names()) | set(cascade)):
+        di = _read_dropin(name)
+        records = cascade.get(name, [])
+        active = name in live
+        banned = None
+        if active:
+            try:
+                banned = _jail_status(name)['currently_banned']
+            except F2BError:
+                banned = None
+        if active:
+            tun = _jail_tunables_live(name)
+        else:
+            tun = {k: _effective(records, k)[0]
+                   for k in ('bantime', 'findtime', 'maxretry')}
+        filt = (di or {}).get('filter') or _effective(records, 'filter')[0] or ''
+        rows.append({'name': name, 'managed': bool(di and di.get('_marker')),
+                     'active': active, 'filter': filt, 'banned': banned,
+                     'bantime': tun['bantime'], 'findtime': tun['findtime'],
+                     'maxretry': tun['maxretry'],
+                     'conflict': _jail_conflict(records),
+                     'overridden': _jail_overridden(records)})
+    return rows
+
+
+def _jail_facets(row):
+    """Facet tags for a jail row: run state, provenance, and cascade hygiene
+    (D68). conflict = same-tier ambiguity; overridden = cross-tier layering."""
+    tags = ['active' if row['active'] else 'inactive']
+    tags.append('managed' if row['managed'] else 'foreign')
+    if row.get('conflict'):
+        tags.append('conflict')
+    if row.get('overridden'):
+        tags.append('overridden')
+    return tags
+
+
+def _jail_actions(active):
+    if active:
+        return [suctlmod.surface.action('fail2ban.jail.deactivate', 'deactivate')]
+    return [suctlmod.surface.action('fail2ban.jail.activate', 'activate')]
+
+
+def _jail_subject(r):
+    banned_val = r['banned'] if r['banned'] is not None else '—'
+    bcolor = 'warn' if isinstance(r['banned'], int) and r['banned'] > 0 else None
+    return suctlmod.surface.subject(r['name'], r['name'], {
+        'filter':   suctlmod.surface.col(r['filter'] or '—'),
+        'banned':   suctlmod.surface.col(banned_val, bcolor),
+        'status':   suctlmod.surface.col('active' if r['active'] else 'inactive',
+                                         'ok' if r['active'] else 'ghost'),
+        'bantime':  suctlmod.surface.col(_fmt(r.get('bantime'))),
+        'findtime': suctlmod.surface.col(_fmt(r.get('findtime'))),
+        'maxretry': suctlmod.surface.col(_fmt(r.get('maxretry'))),
+    }, inline_actions=_jail_actions(r['active']), facets=_jail_facets(r))
+
+
+def _catalog_subject(entry):
+    """An uninstalled catalog recipe rendered as an 'available' jail row whose
+    only action is create. Tunables shown are the recipe's proposed values."""
+    name = entry.get('name', '')
+    return suctlmod.surface.subject(name, name, {
+        'filter':   suctlmod.surface.col(entry.get('filter') or '—'),
+        'banned':   suctlmod.surface.col('—'),
+        'status':   suctlmod.surface.col('available', 'ghost'),
+        'bantime':  suctlmod.surface.col(_fmt(entry.get('bantime'))),
+        'findtime': suctlmod.surface.col(_fmt(entry.get('findtime'))),
+        'maxretry': suctlmod.surface.col(_fmt(entry.get('maxretry'))),
+    }, inline_actions=[suctlmod.surface.action('fail2ban.jail.create', 'create')],
+       facets=['available'])
+
+
+def jail_survey(args):
+    rows = _collect_jails()
+    existing = {r['name'] for r in rows}
+    subjects = [_jail_subject(r) for r in rows]
+    # Fold in catalog recipes not yet installed, as 'available' rows.
+    for entry in CATALOG:
+        if entry.get('name') and entry['name'] not in existing:
+            subjects.append(_catalog_subject(entry))
+    return suctlmod.surface.survey(subjects)
+
+
+def jail_focus(args):
+    jail = _require(args, 'jail')
+    di = _read_dropin(jail)
+    records = _cascade_jails().get(jail, [])
+    managed = bool(di and di.get('_marker'))
+    live = []
+    try:
+        live = _server_jails()
+    except F2BError:
+        pass
+    active = jail in live
+    cfg = [suctlmod.surface.field('ownership', 'managed' if managed else 'foreign',
+                                  color='ok' if managed else 'ghost'),
+           suctlmod.surface.field('status', 'active' if active else 'inactive',
+                                  color='ok' if active else 'ghost')]
+    if _jail_conflict(records):
+        cfg.append(suctlmod.surface.field(
+            'conflict', 'same-tier ambiguity — see precedence', color='err'))
+    elif _jail_overridden(records):
+        cfg.append(suctlmod.surface.field(
+            'layering', 'values overridden across files — see precedence',
+            color='warn'))
+    for label in _ORDER:
+        v = (di or {}).get(label)
+        if v:
+            cfg.append(suctlmod.surface.field(label, v))
+    sections = [suctlmod.surface.section('configuration', cfg)]
+    prov = _provenance_fields(records)
+    if prov:
+        sections.append(suctlmod.surface.section('precedence (cascade)', prov))
+    if active:
+        eff = [suctlmod.surface.field(k, _fmt(v)) for k, v in _jail_config(jail)]
+        sections.append(suctlmod.surface.section('effective configuration', eff))
+    if active:
+        try:
+            st = _jail_status(jail)
+            sections.append(suctlmod.surface.section('live', [
+                suctlmod.surface.field('currently banned', st['currently_banned'],
+                                       color='warn' if st['currently_banned'] else None),
+                suctlmod.surface.field('total banned', st['total_banned']),
+                suctlmod.surface.field('currently failed', st['currently_failed']),
+                suctlmod.surface.field('total failed', st['total_failed']),
+            ]))
+            if st['banned']:
+                sections.append(suctlmod.surface.section('banned ips', [
+                    suctlmod.surface.field(ip, 'banned', color='warn') for ip in st['banned']]))
+        except F2BError:
+            pass
+    actions = _jail_actions(active)
+    actions.append(suctlmod.surface.action('fail2ban.jail.delete', 'delete',
+                                           destructive=True))
+    return suctlmod.surface.focus(jail, jail, sections, actions=actions)
+
+
+# ── banned_ip surface ─────────────────────────────────────────────────────────
+
+def _banned_index():
+    """Map banned IP → jails holding it across all live jails; {} if down."""
+    index = {}
+    try:
+        live = _server_jails()
+    except F2BError:
+        return index
+    for jail in live:
+        try:
+            for ip in _jail_status(jail)['banned']:
+                index.setdefault(ip, []).append(jail)
+        except F2BError:
+            continue
+    return index
+
+
+def banned_survey(args):
+    index = _banned_index()
+    subjects = []
+    for ip in sorted(index):
+        jails = sorted(index[ip])
+        subjects.append(suctlmod.surface.subject(ip, ip, {
+            'ip': suctlmod.surface.col(ip),
+            'jail': suctlmod.surface.col(', '.join(jails)),
+            'banned': suctlmod.surface.col(len(jails), 'warn'),
+        }, inline_actions=[suctlmod.surface.action('fail2ban.banned.unban', 'unban')]))
+    return suctlmod.surface.survey(subjects)
+
+
+def banned_focus(args):
+    ip = _require(args, 'ip')
+    holders = sorted(_banned_index().get(ip, []))
+    if holders:
+        fields = [suctlmod.surface.field(j, 'banned', color='warn') for j in holders]
+    else:
+        fields = [suctlmod.surface.field('status', 'not currently banned', color='ghost')]
+    return suctlmod.surface.focus(ip, ip,
+                                  [suctlmod.surface.section('jails holding this ip', fields)],
+                                  actions=[suctlmod.surface.action('fail2ban.banned.unban',
+                                                                   'unban (all jails)')])
+
+
+# ── effective config helpers (read-only; live fail2ban truth) ─────────────────
+# fail2ban exposes effective values only, via per-jail getters (bantime /
+# findtime / maxretry / ignoreip / logpath). There is no queryable [DEFAULT] and
+# no provenance — these report what is in force, never where it was configured.
+
+
+def _fmt(v):
+    if v is None:
+        return '—'
+    if isinstance(v, (list, tuple)):
+        return ', '.join(str(x) for x in v) if v else '—'
+    s = str(v)
+    return s if s else '—'
+
+
+def _server_get(*args):
+    try:
+        return f2b('get', *args)
+    except F2BError:
+        return None
+
+
+def _jail_config(name):
+    return [('bantime', _server_get(name, 'bantime')),
+            ('findtime', _server_get(name, 'findtime')),
+            ('maxretry', _server_get(name, 'maxretry')),
+            ('ignoreip', _server_get(name, 'ignoreip')),
+            ('logpath', _server_get(name, 'logpath'))]
+
+
+def _jail_tunables_live(name):
+    """The three survey tunables as effective live values; None when unset."""
+    return {'bantime': _server_get(name, 'bantime'),
+            'findtime': _server_get(name, 'findtime'),
+            'maxretry': _server_get(name, 'maxretry')}
+
+
+# ── runtime bans (fail2ban server) ────────────────────────────────────────────
+
+def _need_ip(args):
+    ip = _arg(args, 'ip')
+    if ip is None:
+        raise suctlmod.CapError('INVALID_PARAMS', 'ip is required')
+    return ip
+
+
+def banned_ban(args):
+    ip = _require(args, 'ip')
+    jail = _arg(args, 'jail')
+    if jail is None:
+        raise suctlmod.CapError('INVALID_PARAMS', 'jail is required')
+    try:
+        f2b('set', jail, 'banip', ip)
+    except F2BError as exc:
+        raise suctlmod.CapError('CALLABLE_FAILED', str(exc))
+    return {'banned': ip, 'jail': jail}
+
+
+def banned_unban(args):
+    ip = _require(args, 'ip')
+    jail = _arg(args, 'jail')
+    try:
+        f2b('set', jail, 'unbanip', ip) if jail else f2b('unban', ip)
+    except F2BError as exc:
+        raise suctlmod.CapError('CALLABLE_FAILED', str(exc))
+    return {'unbanned': ip, 'jail': jail or 'all'}
+
+
+def catalog_list(args):
+    return {'jails': [{'name': j.get('name'), 'filter': j.get('filter'),
+                       'desc': j.get('desc', '')}
+                      for j in CATALOG]}
+
+
+# ── Module wiring ─────────────────────────────────────────────────────────────
+
+mod = suctlmod.Module('suctl-mod-fail2ban', MANIFEST_PATH, log_file=LOG_FILE)
+
+mod.capability('fail2ban.jail.survey')(jail_survey)
+mod.capability('fail2ban.jail.focus')(jail_focus)
+mod.capability('fail2ban.jail.create')(lambda a: jail_create(_require(a, 'jail')))
+mod.capability('fail2ban.jail.delete')(lambda a: jail_delete(_require(a, 'jail')))
+mod.capability('fail2ban.jail.activate')(lambda a: jail_activate(_require(a, 'jail')))
+mod.capability('fail2ban.jail.deactivate')(lambda a: jail_deactivate(_require(a, 'jail')))
+mod.capability('fail2ban.catalog.list')(catalog_list)
+mod.capability('fail2ban.banned_ip.survey')(banned_survey)
+mod.capability('fail2ban.banned_ip.focus')(banned_focus)
+mod.capability('fail2ban.banned.ban')(banned_ban)
+mod.capability('fail2ban.banned.unban')(banned_unban)
+mod.capability('fail2ban.ignoreip.add')(lambda a: ignoreip_change(_require(a, 'jail'), _need_ip(a), True))
+mod.capability('fail2ban.ignoreip.remove')(lambda a: ignoreip_change(_require(a, 'jail'), _need_ip(a), False))
+
+
+@mod.capability('fail2ban.jail.set')
+def _jail_set(args):
+    jail = _require(args, 'jail')
+    param = _arg(args, 'param')
+    value = _arg(args, 'value')
+    if param is None or value is None:
+        raise suctlmod.CapError('INVALID_PARAMS', 'param and value are required')
+    return jail_set(jail, param, value)
+
+
+if __name__ == '__main__':
+    mod.run()

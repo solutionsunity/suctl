@@ -1,0 +1,36 @@
+{
+  "_note": "Slim recipe: intrinsic identity (filter/backend/logpath/port) + security-intent overrides only. Generic baseline (bantime/findtime/ignoreip/bantime.increment) is intentionally omitted so each jail inherits the operator's [DEFAULT]. backend=polling is intrinsic to file-based log monitoring.",
+  "jails": [
+    {
+      "name": "nginx-scanner",
+      "filter": "nginx-scanner",
+      "backend": "polling",
+      "logpath": "/var/log/nginx/access.log",
+      "port": "http,https",
+      "maxretry": 3,
+      "findtime": 60,
+      "bantime": 86400,
+      "desc": "Scans for sensitive paths and script extensions (.env/.git/*.php/…)"
+    },
+    {
+      "name": "nginx-http-error",
+      "filter": "nginx-http-error",
+      "backend": "polling",
+      "logpath": "/var/log/nginx/access.log",
+      "port": "http,https",
+      "maxretry": 20,
+      "desc": "Repeated 403/404 with no Referer (direct probing)"
+    },
+    {
+      "name": "odoo-server",
+      "filter": "odoo-server",
+      "backend": "polling",
+      "logpath": "/var/log/odoo/odoo-server.log",
+      "port": "http,https",
+      "maxretry": 10,
+      "findtime": 11400,
+      "bantime": 11400,
+      "desc": "Odoo login failures"
+    }
+  ]
+}

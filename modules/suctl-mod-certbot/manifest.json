@@ -1,0 +1,57 @@
+{
+  "version": "0.1.0",
+  "protocol": "1",
+  "platform": ["linux"],
+  "author": "suctl",
+  "license": "Apache-2.0",
+  "description": "Manages Let's Encrypt / ACME certificates via the certbot CLI.",
+  "entrypoint": "suctl-mod-certbot",
+
+  "requires": {
+    "binaries": ["certbot"],
+    "paths": ["/etc/letsencrypt"]
+  },
+
+  "capabilities": [
+    {
+      "name": "certbot.cert.list",
+      "description": "List all certbot-managed certificates with expiry and SAN domains.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "certbot.cert.read",
+      "description": "Read one certbot-managed certificate by name (primary domain).",
+      "async": false,
+      "params": [
+        {"name": "name", "type": "string", "required": true, "description": "Certificate name (typically the primary domain)"}
+      ]
+    },
+    {
+      "name": "certbot.cert.provision",
+      "description": "Provision a new Let's Encrypt certificate via certbot --nginx.",
+      "async": true,
+      "params": [
+        {"name": "domain",        "type": "string",  "required": true,  "description": "Primary domain"},
+        {"name": "email",         "type": "string",  "required": true,  "description": "Email for Let's Encrypt registration"},
+        {"name": "extra_domains", "type": "string",  "required": false, "description": "Space-separated additional SAN domains"}
+      ]
+    },
+    {
+      "name": "certbot.cert.renew",
+      "description": "Renew a certbot-managed certificate via certbot renew --cert-name.",
+      "async": true,
+      "params": [
+        {"name": "name", "type": "string", "required": true, "description": "Certificate name to renew"}
+      ]
+    },
+    {
+      "name": "certbot.cert.remove",
+      "description": "Delete a certbot-managed certificate via certbot delete --cert-name.",
+      "async": false,
+      "params": [
+        {"name": "name", "type": "string", "required": true, "description": "Certificate name to delete"}
+      ]
+    }
+  ]
+}

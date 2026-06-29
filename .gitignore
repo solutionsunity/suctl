@@ -1,0 +1,42 @@
+# suctl — .gitignore
+
+# Build artifacts (Make builds into bin/<os>-<arch>/)
+bin/
+dist/
+vendor/
+*.exe
+*.test
+*.out
+*.prof
+coverage.out
+
+# Stray local binaries from in-tree `go build`
+/suctl
+/suctl-modtest
+
+# Compiled Go module binaries — interpreted entrypoints are source, re-included
+modules/suctl-mod-*/suctl-mod-*
+!modules/suctl-mod-fail2ban/suctl-mod-fail2ban
+!modules/suctl-mod-odoo/suctl-mod-odoo
+
+# Python runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.env
+.env
+*.key
+*.pem

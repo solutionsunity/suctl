@@ -1,0 +1,81 @@
+{
+  "surfaces": [
+    {
+      "subject": "database",
+      "survey": {
+        "entry": "odoo.database.survey",
+        "columns": [
+          { "id": "modules", "label": "modules", "align": "right", "from": "odoo.database.overview" },
+          { "id": "users",   "label": "users",   "align": "right", "from": "odoo.database.overview" },
+          { "id": "status",  "label": "status",                    "from": "odoo.database.overview" }
+        ]
+      },
+      "focus": {
+        "entry": "odoo.database.focus"
+      },
+      "drills": [
+        {
+          "subject": "module",
+          "label": "modules",
+          "survey": {
+            "entry": "odoo.module.survey",
+            "columns": [
+              { "id": "summary", "label": "summary" },
+              { "id": "version", "label": "version" },
+              { "id": "status",  "label": "status"  }
+            ],
+            "facets": [
+              { "label": "installed",     "value": "installed"   },
+              { "label": "not installed", "value": "uninstalled" },
+              { "label": "upgradable",    "value": "upgradable"  }
+            ],
+            "actions": [
+              { "capability": "odoo.module.upgrade-selected", "label": "upgrade" },
+              { "capability": "odoo.module.upgrade-all",      "label": "upgrade all" }
+            ]
+          },
+          "focus": {
+            "entry": "odoo.module.focus"
+          }
+        },
+        {
+          "subject": "user",
+          "label": "users",
+          "survey": {
+            "entry": "odoo.user.survey",
+            "columns": [
+              { "id": "login",  "label": "login"  },
+              { "id": "status", "label": "status" }
+            ],
+            "facets": [
+              { "label": "active",   "value": "active"   },
+              { "label": "inactive", "value": "inactive" }
+            ]
+          },
+          "focus": {
+            "entry": "odoo.user.focus"
+          }
+        }
+      ]
+    },
+    {
+      "subject": "server",
+      "name": "server",
+      "desc": "Odoo service status — reachability and loaded-code restart state. Drill in for the host-wide upgrade-drift breakdown.",
+      "survey": {
+        "entry": "odoo.server.survey",
+        "columns": [
+          { "id": "service", "label": "service" },
+          { "id": "restart", "label": "restart" }
+        ],
+        "actions": [
+          { "capability": "odoo.server.upgrade-drifted", "label": "auto upgrade" },
+          { "capability": "odoo.server.restart-service", "label": "restart service", "destructive": true }
+        ]
+      },
+      "focus": {
+        "entry": "odoo.server.focus"
+      }
+    }
+  ]
+}

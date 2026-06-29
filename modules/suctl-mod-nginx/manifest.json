@@ -1,0 +1,128 @@
+{
+  "version": "0.5.0",
+  "protocol": "1",
+  "platform": ["linux"],
+  "author": "suctl",
+  "license": "Apache-2.0",
+  "description": "Manages nginx virtual hosts and per-domain availability state. SSL/ACME certificates are managed by suctl-mod-certbot.",
+  "entrypoint": "suctl-mod-nginx",
+
+  "requires": {
+    "binaries": ["nginx"],
+    "paths": ["/etc/nginx/sites-available", "/etc/nginx/sites-enabled"],
+    "capabilities": ["certbot.cert.list", "certbot.cert.provision"]
+  },
+
+  "capabilities": [
+    {
+      "name": "nginx.domain.add",
+      "description": "Add a new nginx-managed domain (creates server block, enables site).",
+      "async": false,
+      "params": [
+        {"name": "domain", "type": "string",  "required": true,  "description": "Primary domain name"},
+        {"name": "www",    "type": "boolean", "required": false, "description": "Include www variant in server_name"}
+      ]
+    },
+    {
+      "name": "nginx.domain.list",
+      "description": "List all nginx-managed domains with state information.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "nginx.domain.suspend",
+      "description": "Suspend a domain by writing a high-priority conf.d override.",
+      "async": false,
+      "params": [
+        {"name": "domain", "type": "string", "required": true, "description": "Domain name"}
+      ]
+    },
+    {
+      "name": "nginx.domain.unsuspend",
+      "description": "Unsuspend a domain by removing its conf.d suspension override.",
+      "async": false,
+      "params": [
+        {"name": "domain", "type": "string", "required": true, "description": "Domain name"}
+      ]
+    },
+    {
+      "name": "nginx.maintenance.enable",
+      "description": "Enable maintenance mode for a domain (or all domains).",
+      "async": false,
+      "params": [
+        {"name": "domain", "type": "string",  "required": false, "description": "Domain name (omit when all=true)"},
+        {"name": "all",    "type": "boolean", "required": false, "description": "Apply to all domains"}
+      ]
+    },
+    {
+      "name": "nginx.maintenance.disable",
+      "description": "Disable maintenance mode for a domain (or all domains).",
+      "async": false,
+      "params": [
+        {"name": "domain", "type": "string",  "required": false, "description": "Domain name (omit when all=true)"},
+        {"name": "all",    "type": "boolean", "required": false, "description": "Apply to all domains"}
+      ]
+    },
+    {
+      "name": "nginx.reload",
+      "description": "Reload nginx configuration without dropping connections.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "nginx.domain.survey",
+      "description": "Render the ambient domain landscape for the survey, including the per-row DNS classification (dns column) and a dns-elsewhere count folded into the status summary. Each row is tagged with applicable facet values (status + ssl:state); core filters locally. Async — resolves every domain's DNS concurrently under one bounded deadline, so the survey is pushed via job_update when the work completes.",
+      "async": true,
+      "params": []
+    },
+    {
+      "name": "nginx.domain.focus",
+      "description": "Render the focus view for a selected domain.",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Domain to focus on"}
+      ]
+    },
+    {
+      "name": "nginx.provision",
+      "description": "Provision a new domain with nginx configuration and a Let's Encrypt certificate via certbot.",
+      "async": true,
+      "params": [
+        {"name": "domain",                "type": "string",  "required": true,  "description": "Domain name"},
+        {"name": "www",                   "type": "boolean", "required": false, "description": "Include www variant"},
+        {"name": "ssl_certificate_email", "type": "string",  "required": true,  "description": "Email for Let's Encrypt registration"}
+      ]
+    },
+    {
+      "name": "nginx.source.survey",
+      "description": "Render the config-file landscape under sites-available for the source surface. The default file reports how many of its blocks are migratable.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "nginx.source.focus",
+      "description": "Render the focus view for a selected config file, including its contained server blocks.",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Config file name (e.g. default)"}
+      ]
+    },
+    {
+      "name": "nginx.block.survey",
+      "description": "List the server blocks contained in one config file (drill child of the source surface).",
+      "async": false,
+      "params": [
+        {"name": "scope", "type": "string", "required": true, "description": "Config file name whose blocks to list"}
+      ]
+    },
+    {
+      "name": "nginx.source.migrate",
+      "description": "Lift server blocks out of the default site into their own per-domain files, then reload nginx. With all=true every migratable block moves; otherwise only the named block.",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string",  "required": false, "description": "Block primary server_name to migrate (or the default file name to migrate all)"},
+        {"name": "all",     "type": "boolean", "required": false, "description": "Migrate every migratable block from default"}
+      ]
+    }
+  ]
+}

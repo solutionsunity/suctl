@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""
+suctl-mod-odoo — suctl module for managing Odoo modules, databases and users.
+
+Speaks the suctl module protocol v1. Core hands this process one end of a
+private, pre-connected, full-duplex socketpair inherited as SUCTL_BROKER_FD
+(fd 3); possession of that wire is this module's identity (D-IDENT). This
+process does NOT listen, accept, bind, or unlink any socket: it runs a single
+read loop over that one wire, demultiplexing inbound core requests (cmd set)
+from responses to its own outbound calls (status set).
+
+This file contains NO Odoo ORM logic. All capability work is delegated to
+suctl-odoo-service, which runs inside Odoo's process (via systemd ExecStartPost)
+and owns the Odoo-side Unix socket at ODOO_SERVICE_SOCK.
+
+See docs/98-module-lifecycle.md — service-attached pattern.
+"""
+
+import json
+import os
+import socket
+import subprocess
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# Prefer a vendored suctlmod (staged alongside this entrypoint); fall back to the
+# repo SDK at sdk/python for in-tree/dev runs (e.g. BIST on the source dir).
+for _p in (_HERE, os.path.join(_HERE, '..', '..', 'sdk', 'python')):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import suctlmod
+
+MANIFEST_PATH     = os.path.join(_HERE, 'manifest.json')
+LOG_FILE          = '/var/log/suctl/suctl-mod-odoo.log'
+ODOO_SERVICE_SOCK = '/run/suctl/suctl-mod-odoo/odoo.sock'
+ODOO_SOCK_TIMEOUT    = 30    # seconds — interactive reads (list/survey/focus, quick writes)
+ODOO_LONG_OP_TIMEOUT = 1800  # seconds — async ORM work: installs, upgrades, reconcile,
+                             # data reloads, db create/duplicate. Registry rebuilds run for
+                             # minutes; the read must outlast them or the client gives up
+                             # while the operation keeps running server-side.
+# Odoo systemd unit — the host-wide restart target. Overridable to match the
+# unit the pre-activate hook wired (defaults align with hooks/pre-activate.sh).
+ODOO_UNIT            = os.environ.get('ODOO_UNIT', 'odoo.service')
+ODOO_RESTART_TIMEOUT = 120   # seconds — systemctl restart of the Odoo unit (≥ systemd's
+                             # default TimeoutStartSec so we don't give up before it does)
+
+
+# ── Odoo service socket call ──────────────────────────────────────────────────
+
+def _call_odoo_service(cap_name, args, timeout=None):
+    """
+    Forward a capability call to suctl-odoo-service via the Odoo-side socket.
+
+    The read timeout defaults to the capability's declared mode: an async cap
+    (install/upgrade/reconcile/…) gets ODOO_LONG_OP_TIMEOUT, every other cap the
+    short interactive ODOO_SOCK_TIMEOUT. Pass timeout explicitly to override.
+
+    Internal protocol (newline-delimited JSON):
+      Request:  {"name": "<cap>", "args": {...}}
+      Response: {"ok": true, "data": ...}
+               {"ok": false, "error": {"code": "...", "message": "..."}}
+
+    Returns (result_data, err_code, err_msg).
+    """
+    # Create the socket before the try-finally so close() is always called,
+    # including when connect() raises (FileNotFoundError, ConnectionRefusedError).
+    if timeout is None:
+        timeout = ODOO_LONG_OP_TIMEOUT if cap_name in mod._async else ODOO_SOCK_TIMEOUT
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        try:
+            sock.connect(ODOO_SERVICE_SOCK)
+        except FileNotFoundError:
+            return None, 'CALLABLE_FAILED', 'odoo service socket not present — is Odoo running?'
+        except ConnectionRefusedError:
+            return None, 'CALLABLE_FAILED', 'odoo service socket refused connection'
+
+        request = json.dumps({'name': cap_name, 'args': args or {}})
+        sock.sendall(request.encode() + b'\n')
+
+        buf = b''
+        while b'\n' not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return None, 'CALLABLE_FAILED', 'odoo service closed connection without response'
+            buf += chunk
+
+        resp = json.loads(buf.split(b'\n', 1)[0])
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, 'CALLABLE_FAILED', f'odoo service communication error: {exc}'
+    finally:
+        sock.close()
+
+    if resp.get('ok'):
+        return resp.get('data'), None, None
+    err = resp.get('error', {})
+    return None, err.get('code', 'CALLABLE_FAILED'), err.get('message', 'unknown error')
+
+
+def _odoo_service_reachable():
+    """Quick liveness check — connect + ping, return True/False."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect(ODOO_SERVICE_SOCK)
+        sock.sendall(b'{"name":"ping","args":{}}\n')
+        buf = b''
+        while b'\n' not in buf:
+            chunk = sock.recv(256)
+            if not chunk:
+                return False
+            buf += chunk
+        resp = json.loads(buf.split(b'\n', 1)[0])
+        return resp.get('ok') is True
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+# ── Module wiring ─────────────────────────────────────────────────────────────
+# suctl-mod-odoo owns its full capability map: every declared capability resolves
+# to a named handler in this file. There is deliberately NO catch-all default
+# handler. A default handler would silently forward any declared name to the Odoo
+# service, which (a) lets suctl-level logic drift into the service for actions that
+# are not Odoo ORM work, and (b) hides mis-wired or renamed capabilities behind the
+# service boundary. The attached service is for Odoo actions only. Pure ORM
+# operations are still forwarded verbatim, but each is registered explicitly below
+# so the boundary is visible and the module — not the service — decides what crosses.
+
+mod = suctlmod.Module('suctl-mod-odoo', MANIFEST_PATH, log_file=LOG_FILE)
+
+
+def _forward(cap_name, args):
+    """Forward a pure-ORM capability to suctl-odoo-service verbatim, raising the
+    service's typed error on failure. Used only for capabilities with no suctl-side
+    logic (see _ORM_PASSTHROUGH)."""
+    data, err_code, err_msg = _call_odoo_service(cap_name, args)
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+# Pure Odoo ORM operations: no suctl-side logic, forwarded verbatim to the service.
+# Registered explicitly (not via a catch-all) so the module owns its full capability
+# map. Any capability NOT in this tuple and NOT decorated below is genuinely unknown
+# and is rejected by the SDK with UNKNOWN_CALLABLE.
+_ORM_PASSTHROUGH = (
+    'odoo.module.list',
+    'odoo.module.detect-changes',
+    'odoo.module.force-update-data',
+    'odoo.db.list',
+    'odoo.db.create',
+    'odoo.db.duplicate',
+    'odoo.user.list',
+    'odoo.user.reset-password',
+)
+
+for _cap in _ORM_PASSTHROUGH:
+    mod.capability(_cap)(lambda args, _cap=_cap: _forward(_cap, args))
+
+
+# ── Subject codec ─────────────────────────────────────────────────────────────
+# Child survey subjects carry a composite id: '<db>/<name>' (D66 §lineage).
+# DB names are PostgreSQL identifiers (alnum + _); module technical names and
+# user logins are Python identifiers or email addresses — none contain '/'.
+# Focus and inline-action capabilities receive this composite id as 'subject'
+# and decode it here to reconstruct the (db, name) pair without a scope-stack.
+
+_SEP = '/'
+
+
+def _composite(db, name):
+    return f'{db}{_SEP}{name}'
+
+
+def _decode(subject):
+    """Split '<db>/<name>' → (db, name); returns (None, subject) for bare ids."""
+    idx = subject.find(_SEP)
+    if idx > 0:
+        return subject[:idx], subject[idx + 1:]
+    return None, subject
+
+
+def _require_arg(args, key):
+    val = args.get(key) if isinstance(args, dict) else None
+    if val is None:
+        raise suctlmod.CapError('INVALID_PARAMS', f'missing required param: {key}')
+    return val
+
+
+# ── Database surface ──────────────────────────────────────────────────────────
+
+@mod.capability('odoo.database.survey')
+def database_survey(args):
+    data, err_code, err_msg = _call_odoo_service('odoo.db.list', {})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    dbs = sorted(data) if isinstance(data, list) else []
+    subjects = [suctlmod.surface.subject(name, name, {}) for name in dbs]
+    return suctlmod.surface.survey(subjects)
+
+
+def _db_status(needs_upgrade):
+    """Map a per-db drift list to a (label, color) status cell."""
+    if needs_upgrade:
+        return f'{len(needs_upgrade)} need upgrade', 'warn'
+    return 'current', 'ok'
+
+
+def _needs_upgrade_by_db(modules_verdict):
+    """Invert the host-wide server verdict (name -> {…, needs_upgrade_in[]}) into a
+    per-database list of module names that need upgrading. One walk over the shared
+    fingerprint matrix serves every row, so the survey reads the drift host-wide
+    instead of one db.verdict per database."""
+    by_db = {}
+    for name, info in (modules_verdict or {}).items():
+        for db in (info or {}).get('needs_upgrade_in') or []:
+            by_db.setdefault(db, []).append(name)
+    return by_db
+
+
+def _db_overview_stats(db):
+    """Per-database stats for odoo.database.focus (sections): installed/total
+    modules, active/total users, and the per-db upgrade-drift list. Each is a
+    scoped service call for this one database; raises the service's typed error on
+    failure. The survey overview reads the drift host-wide instead (one
+    server.verdict for all rows — see database_overview)."""
+    mods, err_code, err_msg = _call_odoo_service('odoo.module.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    mods = mods or []
+    users, err_code, err_msg = _call_odoo_service('odoo.user.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    users = users or []
+    verdict, err_code, err_msg = _call_odoo_service('odoo.db.verdict', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return {
+        'modules': (sum(1 for r in mods if r.get('state') == 'installed'), len(mods)),
+        'users':   (sum(1 for r in users if r.get('active', True)), len(users)),
+        'needs_upgrade': list((verdict or {}).get('needs_upgrade') or []),
+    }
+
+
+@mod.capability('odoo.database.overview')
+def database_overview(args):
+    """Whole-column `from` for the database survey: fills the modules, users and
+    status columns of every database row in a single call. Host-wide — one
+    server.verdict gives the upgrade drift for all databases (the expensive
+    fingerprint matrix is computed once and shared, not re-derived per db), while
+    module/user counts are read per database. Async — the row-keyed map rides the
+    terminal job_update so the survey paints progressively. All three columns share
+    this `from` (surface.json), so one call fills the whole column for every row."""
+    data, err_code, err_msg = _call_odoo_service('odoo.db.list', {})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    dbs = sorted(data) if isinstance(data, list) else []
+    modules_verdict, _ = _server_verdict()
+    needs_by_db = _needs_upgrade_by_db(modules_verdict)
+    rows = {}
+    for db in dbs:
+        mods, err_code, err_msg = _call_odoo_service('odoo.module.list', {'db': db})
+        if err_code:
+            raise suctlmod.CapError(err_code, err_msg)
+        mods = mods or []
+        users, err_code, err_msg = _call_odoo_service('odoo.user.list', {'db': db})
+        if err_code:
+            raise suctlmod.CapError(err_code, err_msg)
+        users = users or []
+        mi = sum(1 for r in mods if r.get('state') == 'installed')
+        ua = sum(1 for r in users if r.get('active', True))
+        slabel, scolor = _db_status(needs_by_db.get(db, []))
+        rows[db] = {
+            'modules': suctlmod.surface.col(f'{mi}/{len(mods)}'),
+            'users':   suctlmod.surface.col(f'{ua}/{len(users)}'),
+            'status':  suctlmod.surface.col(slabel, scolor),
+        }
+    return suctlmod.surface.rows(rows)
+
+
+@mod.capability('odoo.database.focus')
+def database_focus(args):
+    """Database detail card: the same module/user counts and drift verdict the
+    survey cells show (odoo.database.overview), rendered as a section. Resolves the
+    former empty-sections stub."""
+    db = _require_arg(args, 'subject')
+    stats = _db_overview_stats(db)
+    mi, mt = stats['modules']
+    ua, ut = stats['users']
+    slabel, scolor = _db_status(stats['needs_upgrade'])
+    return suctlmod.surface.focus(db, db, [suctlmod.surface.section('overview', [
+        suctlmod.surface.field('modules', f'{mi}/{mt} installed'),
+        suctlmod.surface.field('users',   f'{ua}/{ut} active'),
+        suctlmod.surface.field('status',  slabel, color=scolor),
+    ])])
+
+
+# ── Module surface ────────────────────────────────────────────────────────────
+
+_MOD_STATES = {
+    'installed':  ('installed',        'ok'),
+    'uninstalled':('not installed',    'ghost'),
+    'to upgrade': ('upgrade pending',  'warn'),
+    'to install': ('install pending',  'warn'),
+    'to remove':  ('remove pending',   'warn'),
+}
+
+
+def _mod_status(state):
+    return _MOD_STATES.get(state, (state, None))
+
+
+def _mod_facets(row):
+    """Return the facet tags that apply to this module row (D68).
+    Core uses these to filter locally; the module always returns all rows."""
+    state = row.get('state', '')
+    iv    = row.get('installed_version') or ''
+    lv    = row.get('latest_version')    or ''
+    tags  = []
+    if state == 'installed':
+        tags.append('installed')
+    if state == 'uninstalled':
+        tags.append('uninstalled')
+    if state == 'installed' and iv and lv and iv != lv:
+        tags.append('upgradable')
+    return tags
+
+
+def _mod_actions(state, has_files=True):
+    if state == 'installed':
+        return [
+            suctlmod.surface.action('odoo.module.upgrade',   'upgrade'),
+            suctlmod.surface.action('odoo.module.uninstall', 'uninstall', destructive=True),
+        ]
+    if state == 'uninstalled' and has_files:
+        # Only offer install when latest_version is set, meaning the module
+        # source files are present in the addons path. An empty latest_version
+        # means the files are missing from disk — install would fail immediately.
+        return [suctlmod.surface.action('odoo.module.install', 'install')]
+    return []
+
+
+_MODULE_SURVEY_ACTIONS = None
+
+def _get_module_survey_actions():
+    """Lazily load declared module survey actions from surface.json (cached)."""
+    global _MODULE_SURVEY_ACTIONS
+    if _MODULE_SURVEY_ACTIONS is None:
+        _MODULE_SURVEY_ACTIONS = mod.survey_actions('odoo.module.survey')
+    return _MODULE_SURVEY_ACTIONS
+
+
+@mod.capability('odoo.module.survey')
+def module_survey(args):
+    db = (args or {}).get('scope')
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', 'scope (database name) is required for module survey')
+    data, err_code, err_msg = _call_odoo_service('odoo.module.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    subjects = []
+    has_installed = False
+    has_upgradable = False
+    for r in (data or []):
+        name  = r.get('name', '')
+        state = r.get('state', '')
+        iv    = r.get('installed_version') or ''
+        lv    = r.get('latest_version')    or ''
+        slabel, scolor = _mod_status(state)
+        if state == 'installed':
+            has_installed = True
+        facets = _mod_facets(r)
+        if 'upgradable' in facets:
+            has_upgradable = True
+        subjects.append(suctlmod.surface.subject(
+            _composite(db, name), name, {
+                'summary': suctlmod.surface.col(r.get('shortdesc') or ''),
+                'version': suctlmod.surface.col(iv or lv or '—', 'ghost' if not iv else None),
+                'status':  suctlmod.surface.col(slabel, scolor),
+            },
+            inline_actions=_mod_actions(state, bool(lv)),
+            facets=facets,
+        ))
+    # Return survey-level actions based on what makes sense for this database:
+    # - "upgrade" (upgrade-selected) is enabled when there are upgradable modules.
+    # - "upgrade all" is enabled when there are any installed modules.
+    declared = _get_module_survey_actions()
+    enabled_caps = set()
+    if has_upgradable:
+        enabled_caps.add('odoo.module.upgrade-selected')
+    if has_installed:
+        enabled_caps.add('odoo.module.upgrade-all')
+    survey_actions = [a for a in declared if a.get('capability') in enabled_caps]
+    return suctlmod.surface.survey(subjects, actions=survey_actions or None)
+
+
+@mod.capability('odoo.module.focus')
+def module_focus(args):
+    subject = _require_arg(args, 'subject')
+    db, name = _decode(subject)
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', f'malformed module subject: {subject!r}')
+    data, err_code, err_msg = _call_odoo_service('odoo.module.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    row = next((r for r in (data or []) if r.get('name') == name), None)
+    if row is None:
+        raise suctlmod.CapError('ERR_NOT_FOUND', f'module {name!r} not found in {db!r}')
+    state = row.get('state', '')
+    iv    = row.get('installed_version') or ''
+    lv    = row.get('latest_version')    or ''
+    slabel, scolor = _mod_status(state)
+    fields = [
+        suctlmod.surface.field('technical name', name),
+        suctlmod.surface.field('display name',   row.get('shortdesc') or '—'),
+        suctlmod.surface.field('installed',       iv or '—', color='ghost' if not iv else None),
+        suctlmod.surface.field('latest',          lv or '—'),
+        suctlmod.surface.field('status',          slabel, color=scolor),
+    ]
+    return suctlmod.surface.focus(subject, name,
+                                  [suctlmod.surface.section('module', fields)],
+                                  actions=_mod_actions(state, bool(lv)) or None)
+
+
+# ── Module action handlers (surface-aware) ────────────────────────────────────
+# When invoked from the surface, args contains 'subject' = '<db>/<module>'.
+# When invoked directly (CLI / test), args contains the original {db, names[]}.
+
+def _module_transition(service_cap, args):
+    subject = (args or {}).get('subject')
+    if subject:
+        db, name = _decode(subject)
+        if db:
+            data, err_code, err_msg = _call_odoo_service(service_cap, {'db': db, 'names': [name]})
+            if err_code:
+                raise suctlmod.CapError(err_code, err_msg)
+            return data
+    # Direct call: forward as-is.
+    data, err_code, err_msg = _call_odoo_service(service_cap, args)
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+@mod.capability('odoo.module.install')
+def module_install(args):
+    return _module_transition('odoo.module.install', args)
+
+
+@mod.capability('odoo.module.upgrade')
+def module_upgrade(args):
+    return _module_transition('odoo.module.upgrade', args)
+
+
+@mod.capability('odoo.module.uninstall')
+def module_uninstall(args):
+    return _module_transition('odoo.module.uninstall', args)
+
+
+@mod.capability('odoo.module.upgrade-selected')
+def module_upgrade_selected(args):
+    """Survey action: upgrade the visible (filtered) subset of modules.
+
+    Core injects {scope: <db>, subjects: ['<db>/<module>', ...]} — the set
+    of subjects currently displayed in the survey (e.g. after applying the
+    'upgradable' facet). This handler decodes each composite id, keeps only
+    those belonging to the declared scope, and upgrades them in a single
+    service call.
+    """
+    a = args or {}
+    db = a.get('scope') or ''
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', 'scope (database name) is required')
+    subjects = a.get('subjects') or []
+    names = []
+    for s in subjects:
+        s_db, name = _decode(s)
+        if s_db == db and name:
+            names.append(name)
+    if not names:
+        return {'upgraded': 0, 'names': []}
+    data, err_code, err_msg = _call_odoo_service('odoo.module.upgrade-selected', {'db': db, 'names': names})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+@mod.capability('odoo.module.upgrade-all')
+def module_upgrade_all(args):
+    """Survey action or direct call: upgrade ALL installed modules in a database.
+
+    Accepts two invocation shapes:
+      - Survey action:  {scope: '<db>', subjects: [...]} — subjects[] ignored.
+      - Direct CLI:     {db: '<db>'}
+    """
+    a = args or {}
+    db = a.get('scope') or a.get('db') or ''
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', 'db or scope (database name) is required')
+    data, err_code, err_msg = _call_odoo_service('odoo.module.upgrade-all', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+# ── User surface ──────────────────────────────────────────────────────────────
+
+def _user_facets(row):
+    """Return the facet tags that apply to this user row (D68)."""
+    active = row.get('active', True)
+    return ['active'] if active else ['inactive']
+
+
+def _user_actions(active):
+    if active:
+        return [suctlmod.surface.action('odoo.user.deactivate', 'deactivate', destructive=True)]
+    return [suctlmod.surface.action('odoo.user.activate', 'activate')]
+
+
+@mod.capability('odoo.user.survey')
+def user_survey(args):
+    db = (args or {}).get('scope')
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', 'scope (database name) is required for user survey')
+    data, err_code, err_msg = _call_odoo_service('odoo.user.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    subjects = []
+    for r in (data or []):
+        login  = r.get('login', '')
+        active = r.get('active', True)
+        subjects.append(suctlmod.surface.subject(
+            _composite(db, login), r.get('name') or login, {
+                'login':  suctlmod.surface.col(login),
+                'status': suctlmod.surface.col(
+                    'active' if active else 'inactive',
+                    'ok'    if active else 'ghost'),
+            },
+            inline_actions=_user_actions(active),
+            facets=_user_facets(r),
+        ))
+    return suctlmod.surface.survey(subjects)
+
+
+@mod.capability('odoo.user.focus')
+def user_focus(args):
+    subject = _require_arg(args, 'subject')
+    db, login = _decode(subject)
+    if not db:
+        raise suctlmod.CapError('INVALID_PARAMS', f'malformed user subject: {subject!r}')
+    data, err_code, err_msg = _call_odoo_service('odoo.user.list', {'db': db})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    row = next((r for r in (data or []) if r.get('login') == login), None)
+    if row is None:
+        raise suctlmod.CapError('ERR_NOT_FOUND', f'user {login!r} not found in {db!r}')
+    active = row.get('active', True)
+    fields = [
+        suctlmod.surface.field('login',        login),
+        suctlmod.surface.field('display name', row.get('name') or '—'),
+        suctlmod.surface.field('status',       'active' if active else 'inactive',
+                               color='ok' if active else 'ghost'),
+    ]
+    return suctlmod.surface.focus(subject, row.get('name') or login,
+                                  [suctlmod.surface.section('user', fields)],
+                                  actions=_user_actions(active))
+
+
+# ── User action handlers (surface-aware) ──────────────────────────────────────
+
+def _user_set_active(active, args):
+    """Decode composite 'db/login' subject or forward direct args."""
+    service_cap = 'odoo.user.activate' if active else 'odoo.user.deactivate'
+    subject = (args or {}).get('subject')
+    if subject:
+        db, login = _decode(subject)
+        if db:
+            data, err_code, err_msg = _call_odoo_service(service_cap, {'db': db, 'login': login})
+            if err_code:
+                raise suctlmod.CapError(err_code, err_msg)
+            return data
+    data, err_code, err_msg = _call_odoo_service(service_cap, args)
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+@mod.capability('odoo.user.activate')
+def user_activate(args):
+    return _user_set_active(True, args)
+
+
+@mod.capability('odoo.user.deactivate')
+def user_deactivate(args):
+    return _user_set_active(False, args)
+
+
+# ── Server surface ────────────────────────────────────────────────────────────
+# Restart-anchored single card: the surface models the Odoo service itself, not a
+# module list. The survey returns exactly one subject ('server') and computes
+# only the cheap birth-snapshot restart verdict (one code-fingerprint pass) plus
+# a reachability ping. The expensive host-wide upgrade-drift matrix is deferred
+# to focus — paid for on drill, not on every survey paint.
+
+_SERVER_NAME = 'server'
+
+_SERVER_SURVEY_ACTIONS = None
+
+def _get_server_survey_actions():
+    """Lazily load declared server survey actions from surface.json (cached)."""
+    global _SERVER_SURVEY_ACTIONS
+    if _SERVER_SURVEY_ACTIONS is None:
+        _SERVER_SURVEY_ACTIONS = mod.survey_actions('odoo.server.survey')
+    return _SERVER_SURVEY_ACTIONS
+
+
+def _restart_verdict():
+    """Cheap server restart verdict from the service: modules running code stale
+    from the birth-snapshot. Returns (needs_restart, snapshot_ready). A missing
+    snapshot (ERR_NO_SNAPSHOT) is reported as not-ready (degraded), never as a
+    restart signal."""
+    data, err_code, err_msg = _call_odoo_service('odoo.server.restart-verdict', {})
+    if err_code == 'ERR_NO_SNAPSHOT':
+        return [], False
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return list((data or {}).get('needs_restart') or []), True
+
+
+def _server_verdict():
+    """Fetch host-wide upgrade drift from the service. Returns (modules, restart),
+    where modules maps name -> {installed_in[], needs_upgrade_in[]}. Expensive
+    (full-fingerprint matrix + per-db stamp reads) — focus-only."""
+    data, err_code, err_msg = _call_odoo_service('odoo.server.verdict', {})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    data = data or {}
+    return data.get('modules') or {}, set(data.get('needs_restart') or [])
+
+
+@mod.capability('odoo.server.survey')
+def server_survey(args):
+    """Single 'server' card: is the service up, and is its loaded code current?"""
+    up = _odoo_service_reachable()
+    restart, snapshot_ready = _restart_verdict() if up else ([], False)
+    needs_restart = bool(restart)
+    if not up or not snapshot_ready:
+        rlabel, rcolor = 'unknown', 'warn'
+    elif needs_restart:
+        rlabel, rcolor = f'needed ({len(restart)})', 'warn'
+    else:
+        rlabel, rcolor = 'current', 'ok'
+    subject = suctlmod.surface.subject(_SERVER_NAME, _SERVER_NAME, {
+        'service': suctlmod.surface.col('up' if up else 'down', 'ok' if up else 'warn'),
+        'restart': suctlmod.surface.col(rlabel, rcolor),
+    })
+    # 'auto upgrade' is idempotent (no-op when nothing drifted) so it is always
+    # offered; 'restart service' only when loaded code is known stale.
+    declared = _get_server_survey_actions()
+    enabled  = {'odoo.server.upgrade-drifted'}
+    if needs_restart:
+        enabled.add('odoo.server.restart-service')
+    actions = [a for a in declared if a.get('capability') in enabled]
+    return suctlmod.surface.survey([subject], actions=actions or None)
+
+
+@mod.capability('odoo.server.focus')
+def server_focus(args):
+    """The 'server' detail card: service status, restart anchor, and the
+    host-wide upgrade-drift breakdown — the full matrix, paid for here on drill."""
+    _require_arg(args, 'subject')
+    if not _odoo_service_reachable():
+        return suctlmod.surface.focus(_SERVER_NAME, _SERVER_NAME, [
+            suctlmod.surface.section('service', [
+                suctlmod.surface.field('odoo service', 'down', color='warn'),
+            ]),
+        ])
+    restart, snapshot_ready = _restart_verdict()
+    if not snapshot_ready:
+        rlabel, rcolor = 'unknown (no snapshot)', 'warn'
+    elif restart:
+        rlabel, rcolor = f'stale — restart required ({len(restart)} module(s))', 'warn'
+    else:
+        rlabel, rcolor = 'current', 'ok'
+    sections = [suctlmod.surface.section('service', [
+        suctlmod.surface.field('odoo service', 'up', color='ok'),
+        suctlmod.surface.field('loaded code', rlabel, color=rcolor),
+    ])]
+    if restart:
+        sections.append(suctlmod.surface.section('stale modules', [
+            suctlmod.surface.field(name, 'restart required', color='warn')
+            for name in restart
+        ]))
+    # Upgrade-drift breakdown — the full host-wide matrix, computed on drill only.
+    modules, _ = _server_verdict()
+    drifted = {n: e for n, e in modules.items() if e.get('needs_upgrade_in')}
+    sections.append(suctlmod.surface.section('upgrade drift', [
+        suctlmod.surface.field('modules drifted', str(len(drifted)),
+                               color='warn' if drifted else 'ok'),
+    ]))
+    for name in sorted(drifted):
+        dbs = sorted(drifted[name].get('needs_upgrade_in') or [])
+        sections.append(suctlmod.surface.section(name, [
+            suctlmod.surface.field(db, 'needs upgrade', color='warn') for db in dbs
+        ]))
+    return suctlmod.surface.focus(_SERVER_NAME, _SERVER_NAME, sections)
+
+
+def _require_trigger(args):
+    """Server bulk actions are surface-triggered: core injects a non-empty
+    'subjects' list (the visible rows). An empty invoke — BIST proof-of-existence
+    or a bare CLI call — must fail fast with INVALID_PARAMS and do no host work."""
+    if not (args or {}).get('subjects'):
+        raise suctlmod.CapError('INVALID_PARAMS',
+                                'subjects is required — this is a server-survey action')
+
+
+@mod.capability('odoo.server.upgrade-drifted')
+def server_upgrade_drifted(args):
+    """Server-survey 'auto upgrade': upgrade every module whose on-disk content
+    drifted from its database stamp, across all databases. The visible subjects
+    gate execution (proof of a real surface trigger); the upgrade itself is
+    host-wide, matching the action's declared semantics."""
+    _require_trigger(args)
+    data, err_code, err_msg = _call_odoo_service('odoo.server.upgrade-drifted', {})
+    if err_code:
+        raise suctlmod.CapError(err_code, err_msg)
+    return data
+
+
+@mod.capability('odoo.server.restart-service')
+def server_restart_service(args):
+    """Server-survey 'restart service': restart the Odoo unit from the suctl side
+    via systemctl, re-anchoring loaded code (clears needs-restart). Runs in the
+    broker process — it never crosses the bridge socket (Odoo restarts under it)."""
+    _require_trigger(args)
+    try:
+        subprocess.run(['systemctl', 'restart', ODOO_UNIT],
+                       check=True, capture_output=True, text=True,
+                       timeout=ODOO_RESTART_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise suctlmod.CapError('CALLABLE_FAILED',
+                                f'systemctl restart {ODOO_UNIT} timed out after {ODOO_RESTART_TIMEOUT}s')
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or '').strip() or str(exc)
+        raise suctlmod.CapError('CALLABLE_FAILED',
+                                f'systemctl restart {ODOO_UNIT} failed: {detail}')
+    return {'restarted': ODOO_UNIT}
+
+
+if __name__ == '__main__':
+    mod.run()

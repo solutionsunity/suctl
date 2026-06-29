@@ -1,0 +1,131 @@
+{
+  "version": "0.1.0",
+  "protocol": "1",
+  "platform": ["linux"],
+  "author": "suctl",
+  "license": "Apache-2.0",
+  "description": "Manages fail2ban jails, banned IPs, and protection parameters.",
+  "entrypoint": "suctl-mod-fail2ban",
+  "requires": {
+    "binaries": ["fail2ban-client"],
+    "paths": ["/etc/fail2ban"],
+    "sockets": ["/var/run/fail2ban/fail2ban.sock"],
+    "permissions": [],
+    "capabilities": [],
+    "config": []
+  },
+  "capabilities": [
+    {
+      "name": "fail2ban.jail.survey",
+      "description": "Render the jail landscape for the survey: suctl-managed and foreign jails (with live ban counts and effective tunables) plus uninstalled catalog recipes shown as 'available' with a create action. Each row is tagged with applicable facet values; core filters locally.",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "fail2ban.jail.focus",
+      "description": "Render the focus view for a selected jail (config, tunables, live ban list, dynamic actions).",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Jail name to focus on"}
+      ]
+    },
+    {
+      "name": "fail2ban.jail.create",
+      "description": "Create a jail from the catalog: install its filter and a disabled jail.d drop-in (no jail.local touch).",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Catalog jail name (e.g. nginx-scanner, nginx-http-error, odoo-server)"}
+      ]
+    },
+    {
+      "name": "fail2ban.jail.delete",
+      "description": "Delete a jail: remove its jail.d drop-in (and its suctl-provided filter, for catalog jails). suctl acts as the operator's hand — any jail may be deleted.",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Jail name"}
+      ]
+    },
+    {
+      "name": "fail2ban.jail.activate",
+      "description": "Enable a jail via its highest-precedence jail.d drop-in (enabled=true) and load it into the running server with `fail2ban-client reload` (the server is config-agnostic and cannot read config itself). Works for any jail without touching jail.local.",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Jail name"}
+      ]
+    },
+    {
+      "name": "fail2ban.jail.deactivate",
+      "description": "Disable a jail via its highest-precedence jail.d drop-in (enabled=false) and stop it over the fail2ban socket. Works for any jail without touching jail.local.",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Jail name"}
+      ]
+    },
+    {
+      "name": "fail2ban.jail.set",
+      "description": "Set a tunable (maxretry, bantime, findtime) via the jail's jail.d drop-in, and apply it live over the socket when the jail is running.",
+      "async": false,
+      "params": [
+        {"name": "jail",  "type": "string", "required": true,  "description": "Jail name"},
+        {"name": "param", "type": "string", "required": true,  "description": "Tunable: maxretry, bantime, or findtime"},
+        {"name": "value", "type": "string", "required": true,  "description": "New value"}
+      ]
+    },
+    {
+      "name": "fail2ban.catalog.list",
+      "description": "List the curated catalog of suctl-provided jails (each with its bundled filter).",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "fail2ban.banned_ip.survey",
+      "description": "Render the banned-IP landscape for the survey (live bans across all jails).",
+      "async": false,
+      "params": []
+    },
+    {
+      "name": "fail2ban.banned_ip.focus",
+      "description": "Render the focus view for a selected banned IP (which jails hold it, since when, dynamic actions).",
+      "async": false,
+      "params": [
+        {"name": "subject", "type": "string", "required": true, "description": "Banned IP address to focus on"}
+      ]
+    },
+    {
+      "name": "fail2ban.banned.ban",
+      "description": "Ban an IP in a jail at runtime over the fail2ban socket.",
+      "async": false,
+      "params": [
+        {"name": "ip",   "type": "string", "required": true, "description": "IP address to ban"},
+        {"name": "jail", "type": "string", "required": true, "description": "Jail to ban it in"}
+      ]
+    },
+    {
+      "name": "fail2ban.banned.unban",
+      "description": "Unban an IP over the fail2ban socket, optionally scoped to one jail.",
+      "async": false,
+      "params": [
+        {"name": "ip",   "type": "string", "required": true,  "description": "IP address to unban"},
+        {"name": "jail", "type": "string", "required": false, "description": "Jail name (omit to unban from all jails)"}
+      ]
+    },
+    {
+      "name": "fail2ban.ignoreip.add",
+      "description": "Add an IP/CIDR to a jail's ignoreip (persisted to its jail.d drop-in) and reload it.",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Jail name"},
+        {"name": "ip",   "type": "string", "required": true, "description": "IP or CIDR to whitelist"}
+      ]
+    },
+    {
+      "name": "fail2ban.ignoreip.remove",
+      "description": "Remove an IP/CIDR from a jail's ignoreip and reload it.",
+      "async": false,
+      "params": [
+        {"name": "jail", "type": "string", "required": true, "description": "Jail name"},
+        {"name": "ip",   "type": "string", "required": true, "description": "IP or CIDR to remove"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""
+suctl-odoo-service — Odoo-side socket server for suctl-mod-odoo.
+
+Started by Odoo's systemd unit via ExecStartPost (docs/98-module-lifecycle.md,
+service-attached pattern). Inherits the Odoo virtualenv, user, environment,
+and PostgreSQL access from the parent systemd unit.
+
+Forks on start so ExecStartPost completes immediately. The child listens on
+ODOO_SERVICE_SOCK, accepts connections from suctl-mod-odoo, and executes ORM
+operations directly using Odoo's registry and api.Environment.
+
+Internal protocol (newline-delimited JSON):
+  Request:  {"name": "<capability>", "args": {...}}
+  Response: {"ok": true, "data": ...}
+            {"ok": false, "error": {"code": "...", "message": "..."}}
+
+Security model
+--------------
+This socket grants ORM superuser access to every Odoo database on the machine.
+It is treated as a high-privilege internal channel and locked down accordingly.
+
+Socket directory (/run/suctl/suctl-mod-odoo/):  mode 0o700, owned by odoo:odoo
+Socket file      (odoo.sock):                    mode 0o600, owned by odoo:odoo
+
+Who can reach the socket:
+  odoo user  — owner; can enter the directory and connect to the socket.
+  root       — Linux DAC is bypassed unconditionally for root. suctl and the
+               suctl server always run as root, so no group membership or
+               permission relaxation is needed.
+  anyone else — blocked at the directory (no x bit for group/other).
+
+Why we do not read the Odoo user from systemd or odoo.conf:
+  Socket ownership is assigned automatically by the OS at bind() time, using
+  the identity of the process that calls it. Because this file is launched via
+  ExecStartPost inside odoo.service, it inherits the unit's User= directive.
+  The correct owner appears without any explicit lookup.
+"""
+
+import datetime
+import hashlib
+import json
+import logging
+import os
+import signal
+import socket
+import stat
+import sys
+from fnmatch import fnmatch
+
+ODOO_SERVICE_SOCK = '/run/suctl/suctl-mod-odoo/odoo.sock'
+LOG_FILE          = '/var/log/suctl/suctl-odoo-service.log'
+
+log = logging.getLogger('suctl-odoo-service')
+
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+class _PlainFormatter(logging.Formatter):
+    def format(self, record):
+        record.message = record.getMessage()
+        ts = datetime.datetime.fromtimestamp(record.created, tz=datetime.timezone.utc)
+        line = (
+            f"{ts.strftime('%Y-%m-%d %H:%M:%S UTC')}  "
+            f"{record.levelname:<5}  suctl-odoo-service  {record.message}"
+        )
+        if record.exc_info:
+            line += '\n' + self.formatException(record.exc_info)
+        return line
+
+
+def _setup_logging():
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = _PlainFormatter()
+    try:
+        fh = logging.FileHandler(LOG_FILE)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except OSError:
+        pass
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    root.addHandler(sh)
+
+
+# ── Odoo bootstrap ────────────────────────────────────────────────────────────
+
+def _bootstrap():
+    import odoo.tools.config as _cfg
+    conf = (
+        os.environ.get('ODOO_RC')
+        or os.environ.get('OPENERP_SERVER')
+        or '/etc/odoo/odoo.conf'
+    )
+    _cfg.parse_config(['--config', conf])
+    log.info('odoo config loaded from %s', conf)
+
+
+# ── Odoo environment helpers ──────────────────────────────────────────────────
+
+def _cursor(db):
+    from odoo import registry
+    return registry(db).cursor()
+
+
+def _env(cr):
+    from odoo import api, SUPERUSER_ID
+    return api.Environment(cr, SUPERUSER_ID, {})
+
+
+# ── Module fingerprinting  ────────────────────────────────────────────────────
+#
+# Two scoped SHA-256 fingerprints per module directory come off one walk. The
+# rule matches core's Go fingerprint: files in sorted relative-path order as
+# path + mode bits + content (symlinks as path + mode + target), mtime never
+# read. The two implementations never share a process, only the rule. On top,
+# OCA module_auto_update's addon_hash exclusions drop asset and test trees that
+# never affect installed state — they also keep the walk near a second.
+
+_HASH_EXCLUDE = ('*.pyc', '*.pyo', 'static/*', 'tests/*')
+
+
+def _hash_excluded(relpath):
+    return any(fnmatch(relpath, pat) for pat in _HASH_EXCLUDE)
+
+
+def _fingerprint(module_dir):
+    """Return (full, code) hex SHA-256 fingerprints of a module directory.
+
+    full — every non-excluded file (py + views + data): the upgrade signal.
+    code — non-excluded .py source only: the restart signal. Its inputs are a
+    subset of full's, so the verdicts nest (a restart is always also an upgrade).
+    Both feed files in sorted relative-path order as path + mode + content
+    (symlinks as path + mode + target).
+    """
+    rels = []
+    for dirpath, dirnames, filenames in os.walk(module_dir):
+        dirnames.sort()
+        for fn in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fn), module_dir)
+            if not _hash_excluded(rel):
+                rels.append(rel)
+    rels.sort()
+
+    h_full = hashlib.sha256()
+    h_code = hashlib.sha256()
+    for rel in rels:
+        path = os.path.join(module_dir, rel)
+        st   = os.lstat(path)
+        head = f'{rel}\x00{st.st_mode:o}\x00'.encode('utf-8')
+        if stat.S_ISLNK(st.st_mode):
+            body = os.readlink(path).encode('utf-8')
+        else:
+            with open(path, 'rb') as f:
+                body = f.read()
+        h_full.update(head); h_full.update(body); h_full.update(b'\x00')
+        if rel.endswith('.py'):
+            h_code.update(head); h_code.update(body); h_code.update(b'\x00')
+    return h_full.hexdigest(), h_code.hexdigest()
+
+
+def _module_dir(name):
+    """Absolute on-disk path of an installed module, or None if not found."""
+    from odoo.modules.module import get_module_path
+    return get_module_path(name, display_warning=False)
+
+
+# ── Birth-snapshot ────────────────────────────────────────────────────────────
+#
+# The code Odoo loaded at process start. Captured in the forked child before it
+# serves (anchored to Odoo's start, not suctl's), it is the anchor for the
+# restart question: a module whose on-disk code fingerprint drifts from its
+# birth value is running stale code until Odoo restarts. In-memory and
+# server-scoped — one process loads one codebase for all databases.
+
+_BIRTH = None
+
+
+def _capture_birth_snapshot():
+    """Record the code fingerprint of every module on disk at start time."""
+    from odoo.modules.module import get_modules
+    snap = {}
+    for name in get_modules():
+        d = _module_dir(name)
+        if not d:
+            continue
+        try:
+            snap[name] = _fingerprint(d)[1]
+        except OSError as exc:
+            log.warning('birth-snapshot: skip %s: %s', name, exc)
+    log.info('birth-snapshot captured: %d modules', len(snap))
+    return snap
+
+
+# ── DB stamps ─────────────────────────────────────────────────────────────────
+#
+# The stamp records the one fact nothing else carries: the full disk fingerprint
+# suctl last applied into this database for each module. It lives in the
+# database's own ir.config_parameter (single key, a JSON {module: fingerprint}
+# map) so it travels with the database through backups, duplicates, and restores
+# — the content and the stamp move atomically. The upgrade verdict is
+# disk-fingerprint ≠ stamp.
+
+_STAMP_KEY = 'suctl.checksums'
+
+
+def _read_stamps(env):
+    """The {module: full-fingerprint} map suctl last applied to this database."""
+    raw = env['ir.config_parameter'].get_param(_STAMP_KEY)
+    if not raw:
+        return {}
+    try:
+        val = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return val if isinstance(val, dict) else {}
+
+
+def _write_stamps(env, stamps):
+    env['ir.config_parameter'].set_param(_STAMP_KEY, json.dumps(stamps, sort_keys=True))
+
+
+def _stamp_modules(env, names):
+    """Record the current full fingerprint of each named module that is in the
+    settled 'installed' state. Modules mid-transition or absent on disk are
+    skipped, so a half-applied stamp is never written."""
+    mods = env['ir.module.module'].search(
+        [('name', 'in', list(names)), ('state', '=', 'installed')]
+    )
+    if not mods:
+        return
+    stamps = _read_stamps(env)
+    for name in mods.mapped('name'):
+        d = _module_dir(name)
+        if d:
+            stamps[name] = _fingerprint(d)[0]
+    _write_stamps(env, stamps)
+
+
+def _prune_stamps(env, names):
+    """Drop stamps for modules that are no longer installed (uninstall/removed)."""
+    stamps = _read_stamps(env)
+    if any(stamps.pop(name, None) is not None for name in list(names)):
+        _write_stamps(env, stamps)
+
+
+def _apply_stamps(db, names, *, prune=False):
+    """Sync the db stamp map after a settled module transition: prune removed
+    modules, or record the current fingerprint of now-installed ones. The cursor
+    commits on clean exit, as elsewhere in this service."""
+    with _cursor(db) as cr:
+        env = _env(cr)
+        if prune:
+            _prune_stamps(env, names)
+        else:
+            _stamp_modules(env, names)
+
+
+# ── Capability result helpers ─────────────────────────────────────────────────
+
+def _ok(data):
+    return {'ok': True, 'data': data}
+
+
+def _err(code, message):
+    return {'ok': False, 'error': {'code': code, 'message': message}}
+
+
+def _require(params, key):
+    val = params.get(key)
+    if val is None:
+        raise ValueError(f'missing required param: {key}')
+    return val
+
+
+def _require_list(params, key):
+    val = _require(params, key)
+    if not isinstance(val, list) or not val:
+        raise ValueError(f'{key} must be a non-empty list')
+    return val
+
+
+# ── Capability handlers ───────────────────────────────────────────────────────
+
+def cmd_ping(_args):
+    return _ok('pong')
+
+
+def cmd_module_list(args):
+    db = _require(args, 'db')
+    with _cursor(db) as cr:
+        rows = _env(cr)['ir.module.module'].search_read(
+            [], ['name', 'shortdesc', 'state', 'installed_version', 'latest_version'],
+            order='name asc',
+        )
+    return _ok(rows)
+
+
+def _module_transition(db, names, to_state, *, requires_installed, result_key):
+    from odoo.modules.registry import Registry
+    with _cursor(db) as cr:
+        env  = _env(cr)
+        mods = env['ir.module.module'].search([('name', 'in', names)])
+        missing = set(names) - set(mods.mapped('name'))
+        if missing:
+            return _err('ERR_MODULE_NOT_FOUND', f'not in addons path: {sorted(missing)}')
+        if requires_installed:
+            wrong = mods.filtered(lambda m: m.state != 'installed')
+            msg   = 'not installed'
+        else:
+            wrong = mods.filtered(lambda m: m.state == 'installed')
+            msg   = 'already installed'
+        if wrong:
+            return _err('ERR_MODULE_CONFLICT', f'{msg}: {sorted(wrong.mapped("name"))}')
+        mods.write({'state': to_state})
+    Registry.new(db, update_module=True)
+    _apply_stamps(db, names, prune=(to_state == 'to remove'))
+    return _ok({result_key: names})
+
+
+def cmd_module_install(args):
+    db, names = _require(args, 'db'), _require_list(args, 'names')
+    return _module_transition(db, names, 'to install', requires_installed=False, result_key='installed')
+
+
+def cmd_module_upgrade(args):
+    db, names = _require(args, 'db'), _require_list(args, 'names')
+    return _module_transition(db, names, 'to upgrade', requires_installed=True, result_key='upgraded')
+
+
+def cmd_module_upgrade_selected(args):
+    """Bulk upgrade for survey-level action: upgrade only the modules from the
+    given list that are currently installed AND have a version mismatch
+    (installed_version != latest_version). Non-installed or already-current
+    modules are silently skipped — the caller passes the full visible subject
+    set which may include any module state."""
+    from odoo.modules.registry import Registry
+    db    = _require(args, 'db')
+    names = _require_list(args, 'names')
+    with _cursor(db) as cr:
+        env  = _env(cr)
+        mods = env['ir.module.module'].search([('name', 'in', names)])
+        # Keep only modules that are installed and whose installed_version
+        # differs from latest_version — i.e. actually need an upgrade.
+        upgradable = mods.filtered(
+            lambda m: m.state == 'installed'
+            and m.installed_version
+            and m.latest_version
+            and m.installed_version != m.latest_version
+        )
+        if not upgradable:
+            return _ok({'upgraded': 0, 'names': []})
+        upgrade_names = upgradable.mapped('name')
+        upgradable.write({'state': 'to upgrade'})
+    Registry.new(db, update_module=True)
+    _apply_stamps(db, upgrade_names)
+    return _ok({'upgraded': len(upgrade_names), 'names': upgrade_names})
+
+
+def cmd_module_upgrade_all(args):
+    from odoo.modules.registry import Registry
+    db = _require(args, 'db')
+    with _cursor(db) as cr:
+        env       = _env(cr)
+        installed = env['ir.module.module'].search([('state', '=', 'installed')])
+        if not installed:
+            return _ok({'upgraded': 0, 'names': []})
+        names = installed.mapped('name')
+        installed.write({'state': 'to upgrade'})
+    Registry.new(db, update_module=True)
+    _apply_stamps(db, names)
+    return _ok({'upgraded': len(names), 'names': names})
+
+
+def cmd_module_uninstall(args):
+    db, names = _require(args, 'db'), _require_list(args, 'names')
+    return _module_transition(db, names, 'to remove', requires_installed=True, result_key='uninstalled')
+
+
+def cmd_module_detect_changes(args):
+    db = _require(args, 'db')
+    with _cursor(db) as cr:
+        rows = _env(cr)['ir.module.module'].search_read(
+            [('state', '=', 'installed')], ['name', 'installed_version', 'latest_version'],
+        )
+    changes = [r for r in rows if r['installed_version'] != r['latest_version']]
+    return _ok({'changes': changes})
+
+
+def cmd_module_force_update_data(args):
+    from odoo.modules.registry import Registry
+    db, name = _require(args, 'db'), _require(args, 'name')
+    with _cursor(db) as cr:
+        env = _env(cr)
+        mod = env['ir.module.module'].search([('name', '=', name), ('state', '=', 'installed')])
+        if not mod:
+            return _err('ERR_MODULE_NOT_FOUND', f'module {name!r} is not installed')
+        locked = env['ir.model.data'].search([('module', '=', name), ('noupdate', '=', True)])
+        count  = len(locked)
+        locked.write({'noupdate': False})
+        mod.write({'state': 'to upgrade'})
+    Registry.new(db, update_module=True)
+    _apply_stamps(db, [name])
+    return _ok({'name': name, 'unlocked_records': count})
+
+
+# ── Server commands ───────────────────────────────────────────────────────────
+
+def _restart_drift():
+    """Modules whose on-disk code drifted from the birth-snapshot — the stale
+    loaded code that a restart would re-anchor. Modules removed from disk since
+    start are not drift. Returns a sorted list of technical names."""
+    stale = []
+    for name, born in (_BIRTH or {}).items():
+        d = _module_dir(name)
+        if not d:
+            continue
+        try:
+            if _fingerprint(d)[1] != born:
+                stale.append(name)
+        except OSError:
+            continue
+    return sorted(stale)
+
+
+def cmd_server_restart_verdict(_args):
+    """Server-scoped restart verdict: modules running stale code.
+
+    An absent birth-snapshot means the capture never ran — distinct from "no
+    drift". The caller maps absence to degraded health, not a restart signal."""
+    if _BIRTH is None:
+        return _err('ERR_NO_SNAPSHOT', 'birth-snapshot not captured')
+    return _ok({'needs_restart': _restart_drift()})
+
+
+def _reconcile_db(env):
+    """Idempotent per-database reconcile: baseline a stamp for any installed
+    module missing one (unknown history is adopted as in-sync, never drift),
+    prune stamps for modules no longer installed, leave valid stamps untouched."""
+    installed = set(
+        env['ir.module.module'].search([('state', '=', 'installed')]).mapped('name')
+    )
+    stamps  = _read_stamps(env)
+    changed = False
+    for name in list(stamps):
+        if name not in installed:
+            del stamps[name]
+            changed = True
+    for name in installed:
+        if name not in stamps:
+            d = _module_dir(name)
+            if d:
+                stamps[name] = _fingerprint(d)[0]
+                changed = True
+    if changed:
+        _write_stamps(env, stamps)
+    return {'installed': len(installed), 'stamped': len(stamps)}
+
+
+def cmd_server_reconcile(_args):
+    """Reconcile stamps across every database — run at on-start and after
+    upgrades. Establishes baselines and prunes removed modules so the verdict
+    that follows reads a clean map."""
+    from odoo.service.db import list_dbs
+    out = {}
+    for db in list_dbs(force=True):
+        with _cursor(db) as cr:
+            out[db] = _reconcile_db(_env(cr))
+    return _ok({'databases': out})
+
+
+def _full_fp_cached(name, cache):
+    """Memoized full fingerprint of a module within one verdict/upgrade call —
+    disk is stable across the call, so each module is walked at most once."""
+    if name not in cache:
+        d = _module_dir(name)
+        try:
+            cache[name] = _fingerprint(d)[0] if d else None
+        except OSError:
+            cache[name] = None
+    return cache[name]
+
+
+def _drifted(name, stamp, cache):
+    """A module needs an upgrade when it has a stamp and its disk full
+    fingerprint differs. No stamp means unknown history — never drift."""
+    if stamp is None:
+        return False
+    fp = _full_fp_cached(name, cache)
+    return fp is not None and fp != stamp
+
+
+def cmd_server_verdict(_args):
+    """Host-wide drift for the server surface: per-module, which databases have
+    it installed and which need an upgrade (disk full fingerprint ≠ db stamp),
+    plus the server-scoped restart list (code drifted from the birth-snapshot).
+
+    The full fingerprint of each module is walked at most once per call (disk is
+    stable within a call), so cost is one walk per module, not per database."""
+    from odoo.service.db import list_dbs
+    cache   = {}
+    modules = {}
+    for db in list_dbs(force=True):
+        with _cursor(db) as cr:
+            installed = _env(cr)['ir.module.module'].search_read(
+                [('state', '=', 'installed')], ['name'],
+            )
+            stamps = _read_stamps(_env(cr))
+        for row in installed:
+            name  = row['name']
+            entry = modules.setdefault(name, {'installed_in': [], 'needs_upgrade_in': []})
+            entry['installed_in'].append(db)
+            if _drifted(name, stamps.get(name), cache):
+                entry['needs_upgrade_in'].append(db)
+
+    return _ok({'modules': modules, 'needs_restart': _restart_drift()})
+
+
+def cmd_db_verdict(args):
+    """Per-database upgrade drift — the cheap, scope-limited counterpart to the
+    host-wide cmd_server_verdict. Walks only the named database's installed
+    modules (disk full fingerprint ≠ db stamp), so the per-db overview cell can
+    be filled one row at a time without an O(databases) host pass. The cross-db
+    fingerprint memoization the host-wide call enjoys is intentionally given up
+    here — a module in several databases is walked once per database — in
+    exchange for a call whose cost is bounded to a single database."""
+    db = _require(args, 'db')
+    cache = {}
+    with _cursor(db) as cr:
+        env = _env(cr)
+        installed = env['ir.module.module'].search_read(
+            [('state', '=', 'installed')], ['name'],
+        )
+        stamps = _read_stamps(env)
+    drifted = [row['name'] for row in installed
+               if _drifted(row['name'], stamps.get(row['name']), cache)]
+    return _ok({'installed': len(installed), 'needs_upgrade': drifted})
+
+
+def cmd_server_upgrade_drifted(_args):
+    """Upgrade every installed module whose disk full fingerprint drifted from
+    its db stamp, across all databases — the server-surface 'auto upgrade'.
+    Re-stamps each database on success."""
+    from odoo.modules.registry import Registry
+    from odoo.service.db import list_dbs
+    cache  = {}
+    result = {}
+    for db in list_dbs(force=True):
+        with _cursor(db) as cr:
+            env       = _env(cr)
+            installed = env['ir.module.module'].search([('state', '=', 'installed')])
+            stamps    = _read_stamps(env)
+            drifted   = installed.filtered(lambda m: _drifted(m.name, stamps.get(m.name), cache))
+            if not drifted:
+                continue
+            names = drifted.mapped('name')
+            drifted.write({'state': 'to upgrade'})
+        Registry.new(db, update_module=True)
+        _apply_stamps(db, names)
+        result[db] = names
+    return _ok({'upgraded': result})
+
+
+# ── Database commands ─────────────────────────────────────────────────────────
+
+def cmd_db_list(_args):
+    from odoo.service.db import list_dbs
+    return _ok(list_dbs(force=True))
+
+
+def cmd_db_create(args):
+    name = _require(args, 'db')
+    from odoo.service.db import exp_create_database
+    exp_create_database(name, False, 'en_US')
+    return _ok({'name': name})
+
+
+def cmd_db_duplicate(args):
+    source, dest = _require(args, 'source'), _require(args, 'dest')
+    from odoo.service.db import exp_duplicate_database
+    exp_duplicate_database(source, dest)
+    return _ok({'source': source, 'dest': dest})
+
+
+# ── User commands ─────────────────────────────────────────────────────────────
+
+def cmd_user_list(args):
+    db = _require(args, 'db')
+    with _cursor(db) as cr:
+        rows = _env(cr)['res.users'].with_context(active_test=False).search_read(
+            [('share', '=', False)], ['login', 'name', 'active'], order='name asc',
+        )
+    return _ok(rows)
+
+
+def cmd_user_reset_password(args):
+    db, login, password = _require(args, 'db'), _require(args, 'login'), _require(args, 'password')
+    with _cursor(db) as cr:
+        env  = _env(cr)
+        user = env['res.users'].with_context(active_test=False).search([('login', '=', login)])
+        if not user:
+            return _err('ERR_NOT_FOUND', f'user {login!r} not found')
+        user.write({'password': password})
+    return _ok({'login': login})
+
+
+def _user_set_active(db, login, active):
+    with _cursor(db) as cr:
+        env  = _env(cr)
+        user = env['res.users'].with_context(active_test=False).search([('login', '=', login)])
+        if not user:
+            return _err('ERR_NOT_FOUND', f'user {login!r} not found')
+        if not active and user.id == 1:
+            return _err('ERR_INVALID_REQUEST', 'cannot deactivate the administrator account')
+        user.write({'active': active})
+    return _ok({'login': login, 'active': active})
+
+
+def cmd_user_activate(args):
+    return _user_set_active(_require(args, 'db'), _require(args, 'login'), True)
+
+
+def cmd_user_deactivate(args):
+    return _user_set_active(_require(args, 'db'), _require(args, 'login'), False)
+
+
+# ── Dispatch table ────────────────────────────────────────────────────────────
+
+_HANDLERS = {
+    'ping':                          cmd_ping,
+    'odoo.module.list':              cmd_module_list,
+    'odoo.module.install':           cmd_module_install,
+    'odoo.module.upgrade':           cmd_module_upgrade,
+    'odoo.module.upgrade-selected':  cmd_module_upgrade_selected,
+    'odoo.module.upgrade-all':       cmd_module_upgrade_all,
+    'odoo.module.uninstall':         cmd_module_uninstall,
+    'odoo.module.detect-changes':    cmd_module_detect_changes,
+    'odoo.module.force-update-data': cmd_module_force_update_data,
+    'odoo.server.restart-verdict':   cmd_server_restart_verdict,
+    'odoo.server.reconcile':         cmd_server_reconcile,
+    'odoo.server.verdict':           cmd_server_verdict,
+    'odoo.db.verdict':               cmd_db_verdict,
+    'odoo.server.upgrade-drifted':   cmd_server_upgrade_drifted,
+    'odoo.db.list':                  cmd_db_list,
+    'odoo.db.create':                cmd_db_create,
+    'odoo.db.duplicate':             cmd_db_duplicate,
+    'odoo.user.list':                cmd_user_list,
+    'odoo.user.reset-password':      cmd_user_reset_password,
+    'odoo.user.activate':            cmd_user_activate,
+    'odoo.user.deactivate':          cmd_user_deactivate,
+}
+
+
+# ── Connection handler ────────────────────────────────────────────────────────
+
+def _handle(conn):
+    buf = b''
+    try:
+        while b'\n' not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        req = json.loads(buf.split(b'\n', 1)[0])
+    except (OSError, json.JSONDecodeError) as exc:
+        try:
+            conn.sendall(json.dumps(_err('INVALID_PARAMS', str(exc))).encode() + b'\n')
+        except OSError:
+            pass
+        return
+
+    name    = req.get('name', '')
+    args    = req.get('args') or {}
+    handler = _HANDLERS.get(name)
+    if not handler:
+        resp = _err('UNKNOWN_CALLABLE', f'unknown capability: {name}')
+    else:
+        log.info('handle: %s', name)
+        try:
+            resp = handler(args)
+        except ValueError as exc:
+            resp = _err('INVALID_PARAMS', str(exc))
+        except Exception as exc:
+            log.exception('capability %r failed', name)
+            ename = type(exc).__name__
+            if 'OperationalError' in ename or 'InterfaceError' in ename:
+                resp = _err('ERR_ODOO_NOT_READY', 'database not reachable')
+            else:
+                resp = _err('CALLABLE_FAILED', str(exc))
+
+    try:
+        conn.sendall(json.dumps(resp).encode() + b'\n')
+    except OSError:
+        pass
+
+
+# ── Socket server ─────────────────────────────────────────────────────────────
+
+def _serve():
+    """Create the socket and serve forever. Runs in the child process."""
+    sock_dir = os.path.dirname(ODOO_SERVICE_SOCK)
+    # 0o700: only the odoo user (owner) and root (DAC bypass) can enter.
+    # suctl always runs as root so no group coordination is needed.
+    os.makedirs(sock_dir, mode=0o700, exist_ok=True)
+
+    # Remove a stale socket from a previous run.
+    try:
+        os.unlink(ODOO_SERVICE_SOCK)
+    except FileNotFoundError:
+        pass
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(ODOO_SERVICE_SOCK)
+    # 0o600: only odoo (owner) connects normally; root (suctl) bypasses DAC.
+    # The 0o700 directory above already blocks every other uid at the path level.
+    os.chmod(ODOO_SERVICE_SOCK, 0o600)
+    srv.listen(16)
+    log.info('listening on %s', ODOO_SERVICE_SOCK)
+
+    def _shutdown(signum, _frame):
+        log.info('signal %d — shutting down', signum)
+        srv.close()
+        try:
+            os.unlink(ODOO_SERVICE_SOCK)
+        except OSError:
+            pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            break
+        try:
+            _handle(conn)
+        finally:
+            conn.close()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    # Fork before any logging setup: parent exits cleanly without any file
+    # handles to flush; child sets up logging fresh in its own process.
+    pid = os.fork()
+    if pid > 0:
+        sys.exit(0)
+
+    # Child only: now safe to open log files and bootstrap Odoo.
+    _setup_logging()
+    _bootstrap()
+    # Capture the code Odoo just loaded, before serving — the restart anchor.
+    global _BIRTH
+    _BIRTH = _capture_birth_snapshot()
+    _serve()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,132 @@
+{
+  "version": "0.1.0",
+  "protocol": "1",
+  "platform": ["linux"],
+  "author": "suctl",
+  "license": "Apache-2.0",
+  "entrypoint": "suctl-mod-os",
+  "description": "Manages systemd services and provides Linux OS diagnostics (logs, resources, processes, network).",
+  "capabilities": [
+    {
+      "name": "os.service.discover",
+      "description": "List all systemd service units with load/active/sub state.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.service.list",
+      "description": "List suctl-registered services with live systemd state.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.service.register",
+      "description": "Register a systemd service for suctl management.",
+      "async": false,
+      "params": [
+        {"name": "name", "type": "string", "required": true, "description": "Service name (without .service suffix)"},
+        {"name": "operations", "type": "string", "required": false, "description": "Comma-separated allowed operations"}
+      ]
+    },
+    {
+      "name": "os.service.unregister",
+      "description": "Remove a service from suctl management.",
+      "async": false,
+      "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
+      "name": "os.service.status",
+      "description": "Get live systemd status for a service.",
+      "async": false,
+      "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
+      "name": "os.service.start",
+      "description": "Start a registered service via systemd D-Bus.",
+      "async": false,
+      "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
+      "name": "os.service.stop",
+      "description": "Stop a registered service via systemd D-Bus.",
+      "async": false,
+      "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
+      "name": "os.service.restart",
+      "description": "Restart a registered service via systemd D-Bus.",
+      "async": false,
+      "params": [{"name": "name", "type": "string", "required": true, "description": "Service name"}]
+    },
+    {
+      "name": "os.log.tail",
+      "description": "Tail the last N log lines for a service from journald or a file.",
+      "async": false,
+      "params": [
+        {"name": "service", "type": "string", "required": true, "description": "Service name"},
+        {"name": "lines", "type": "string", "required": false, "description": "Number of lines (default 50)"},
+        {"name": "source", "type": "string", "required": false, "description": "Log file path (omit for journald)"}
+      ]
+    },
+    {
+      "name": "os.log.since",
+      "description": "Fetch journal entries for a service since a relative duration (e.g. 1h, 30m).",
+      "async": false,
+      "params": [
+        {"name": "service", "type": "string", "required": true, "description": "Service name"},
+        {"name": "since", "type": "string", "required": false, "description": "Duration (default 1h)"}
+      ]
+    },
+    {
+      "name": "os.log.search",
+      "description": "Search journal or log file for a pattern.",
+      "async": false,
+      "params": [
+        {"name": "service", "type": "string", "required": true, "description": "Service name"},
+        {"name": "pattern", "type": "string", "required": true, "description": "Search pattern"},
+        {"name": "source", "type": "string", "required": false, "description": "Log file path (omit for journald)"}
+      ]
+    },
+    {
+      "name": "os.log.level",
+      "description": "Fetch journal entries at or above a syslog priority level.",
+      "async": false,
+      "params": [
+        {"name": "service", "type": "string", "required": true, "description": "Service name"},
+        {"name": "level", "type": "string", "required": false, "description": "Priority: emerg alert crit err warning notice info debug (default err)"}
+      ]
+    },
+    {
+      "name": "os.resource.cpu",
+      "description": "Sample CPU usage across all cores over 500ms.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.resource.memory",
+      "description": "Read /proc/meminfo and return memory statistics.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.resource.disk",
+      "description": "Run df -h and return disk usage.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.process.top",
+      "description": "List top N processes sorted by CPU or memory usage.",
+      "async": false,
+      "params": [
+        {"name": "by", "type": "string", "required": false, "description": "Sort key: cpu (default) or mem"},
+        {"name": "n", "type": "string", "required": false, "description": "Number of processes (default 10)"}
+      ]
+    },
+    {
+      "name": "os.network.ports",
+      "description": "List listening TCP/UDP ports via ss -tlnp.",
+      "async": false, "params": []
+    },
+    {
+      "name": "os.network.connections",
+      "description": "List active network connections via ss -tanp.",
+      "async": false, "params": []
+    }
+  ]
+}

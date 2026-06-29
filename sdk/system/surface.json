@@ -1,0 +1,99 @@
+{
+  "surfaces": [
+    {
+      "subject": "module",
+      "name": "system",
+      "desc": "suctl control-plane — discover, activate, and deactivate modules.",
+      "survey": {
+        "entry": "system.module.survey",
+        "columns": [
+          { "id": "status",  "label": "status" },
+          { "id": "version", "label": "version" },
+          { "id": "caps",    "label": "caps", "align": "right" }
+        ],
+        "facets": [
+          { "label": "active",      "value": "active"      },
+          { "label": "ready",       "value": "ready"       },
+          { "label": "unavailable", "value": "unavailable" },
+          { "label": "missing",     "value": "missing"     },
+          { "label": "failed",      "value": "failed"      }
+        ]
+      },
+      "focus": {
+        "entry": "system.module.focus"
+      }
+    },
+    {
+      "subject": "job",
+      "name": "jobs",
+      "desc": "Jobs visible to the current caller (system → all; module → own).",
+      "survey": {
+        "entry": "system.jobs.survey",
+        "columns": [
+          { "id": "module",     "label": "module"     },
+          { "id": "capability", "label": "capability" },
+          { "id": "state",      "label": "state"      },
+          { "id": "started",    "label": "started", "align": "right" }
+        ],
+        "facets": [
+          { "label": "queued",  "value": "queued"  },
+          { "label": "running", "value": "running" },
+          { "label": "done",    "value": "done"    },
+          { "label": "failed",  "value": "failed"  }
+        ]
+      },
+      "focus": {
+        "entry": "system.jobs.focus"
+      },
+      "drills": [
+        {
+          "subject": "exchange",
+          "label": "messages",
+          "survey": {
+            "entry": "system.messages.survey",
+            "columns": [
+              { "id": "cmd",        "label": "cmd" },
+              { "id": "caller",     "label": "caller" },
+              { "id": "module",     "label": "module" },
+              { "id": "capability", "label": "capability" },
+              { "id": "state",      "label": "state" },
+              { "id": "age",        "label": "age", "align": "right" }
+            ],
+            "facets": [
+              { "label": "pending", "value": "pending" },
+              { "label": "ok",      "value": "ok"      },
+              { "label": "error",   "value": "error"   }
+            ]
+          },
+          "focus": {
+            "entry": "system.messages.focus"
+          }
+        }
+      ]
+    },
+    {
+      "subject": "message",
+      "name": "messages",
+      "desc": "Recorded message exchanges visible to the current caller (system → all; module → own jobs').",
+      "survey": {
+        "entry": "system.messages.survey",
+        "columns": [
+          { "id": "cmd",        "label": "cmd" },
+          { "id": "caller",     "label": "caller" },
+          { "id": "module",     "label": "module" },
+          { "id": "capability", "label": "capability" },
+          { "id": "state",      "label": "state" },
+          { "id": "age",        "label": "age", "align": "right" }
+        ],
+        "facets": [
+          { "label": "pending", "value": "pending" },
+          { "label": "ok",      "value": "ok"      },
+          { "label": "error",   "value": "error"   }
+        ]
+      },
+      "focus": {
+        "entry": "system.messages.focus"
+      }
+    }
+  ]
+}
