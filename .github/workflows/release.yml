@@ -1,0 +1,119 @@
+# Release — cut a GitHub Release whenever internal/version/VERSION changes.
+#
+# Versioning is file-as-truth: the VERSION file is the single source. Bump it on
+# main and push; this workflow reads it, guards against a duplicate tag, builds
+# and packages artifacts for every platform, creates the matching annotated tag,
+# and publishes a Release with the archives + sha256 checksums.
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - internal/version/VERSION
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version + guard against duplicate tag
+        id: v
+        run: |
+          TAG="$(cat internal/version/VERSION)"
+          test -n "$TAG" || { echo "::error::VERSION is empty"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} already exists — bump internal/version/VERSION."
+            exit 1
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${TAG}"
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux builds use CGo (libsystemd/journald) → built natively per arch.
+          - { goos: linux,   goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux,   goarch: arm64, runner: ubuntu-24.04-arm }
+          # macOS/Windows are pure-Go (CGo off) → cross-built from an x64 runner.
+          # No bundled modules on these yet: suctl starts blank, the REPL works.
+          - { goos: windows, goarch: amd64, runner: ubuntu-latest }
+          - { goos: darwin,  goarch: amd64, runner: ubuntu-latest }
+          - { goos: darwin,  goarch: arm64, runner: ubuntu-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Install build deps (Linux only — libsystemd for CGo/journald)
+        if: matrix.goos == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libsystemd-dev pkg-config
+      - name: Vet & test (Go, native on linux/amd64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: make vet test
+      - name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+        run: make all GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }}
+      - name: Package
+        run: |
+          VERSION="${{ needs.preflight.outputs.version }}"
+          PLATFORM="${{ matrix.goos }}-${{ matrix.goarch }}"
+          NAME="suctl-${VERSION}-${PLATFORM}"
+          mkdir -p "dist/${NAME}"
+          cp -r "bin/${PLATFORM}/." "dist/${NAME}/"
+          cp LICENSE NOTICE README.md "dist/${NAME}/"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            ( cd dist && zip -qr "${NAME}.zip" "${NAME}" \
+                && sha256sum "${NAME}.zip" > "${NAME}.zip.sha256" )
+          else
+            tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+            ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suctl-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create annotated tag
+        run: |
+          TAG="${{ needs.preflight.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "suctl ${TAG}"
+          git push origin "${TAG}"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.preflight.outputs.version }}"
+          gh release create "${TAG}" \
+            --title "suctl ${TAG}" \
+            --generate-notes \
+            artifacts/*.tar.gz artifacts/*.zip artifacts/*.sha256

@@ -8,7 +8,6 @@ vendor/
 *.test
 *.out
 *.prof
-coverage.out
 
 # Stray local binaries from in-tree `go build`
 /suctl

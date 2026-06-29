@@ -1,5 +1,10 @@
 # suctl
 
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](go.mod)
+[![Platforms](https://img.shields.io/badge/platforms-linux%20%C2%B7%20macOS%20%C2%B7%20windows-555)](#install)
+[![Release](https://img.shields.io/github/v/release/solutionsunity/suctl?sort=semver)](https://github.com/solutionsunity/suctl/releases)
+
 > **Dead simple. Solid as a mountain.**
 
 suctl is a single-binary server control tool. It opens a REPL that reads your
@@ -30,17 +35,16 @@ irm https://suctl.com/install.ps1 | iex
 suctl
 ```
 
-You land on the home page; the title bar reads the inventory at a glance
-(`N active · M ready`). Everything is a row: `↑↓` moves the selection, `←→` or
-`tab` step across a row's fields and actions, `⏎` enters, `esc` goes back,
-`Alt+q` quits. Start typing on any survey to filter rows instantly.
+You land on the home page. On a fresh install nothing is active yet, so it
+reads `0 active · M ready` — suctl has *found* modules but started none. Tab to
+**inventory**, focus a module (`⏎`), and `activate` it; its surface then
+appears as a row on the home page.
 
-From there the REPL is one loop, three moments:
-
-- **Survey** — the whole domain at once, read live the moment you enter.
-- **Focus** — everything the module knows about one subject, read live.
-- **Act** — actions computed from the subject's current state, not a fixed
-  menu. A suspended domain offers `unsuspend`; `suspend` is simply absent.
+Everything is a row: `↑↓` selects, `←→`/`tab` step across a row's fields and
+actions, `⏎` enters, `esc` goes back, `Alt+q` quits. Start typing on any survey
+to filter rows instantly. The loop is the same on every surface —
+**survey → focus → act** — and the full walkthrough lives at
+[suctl.com](https://suctl.com).
 
 ## Modules
 
@@ -55,6 +59,10 @@ protocol. The bundled set:
 | `suctl-mod-os` | OS services and units |
 | `suctl-mod-fail2ban` | fail2ban jails and filters |
 | `suctl-mod-odoo` | Odoo instance management |
+
+The bundled modules are Linux-only today. On macOS and Windows suctl runs and
+the REPL works — there are simply no bundled modules to activate until you add
+your own.
 
 ## Building from source
 
