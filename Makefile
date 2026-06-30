@@ -20,8 +20,9 @@ PLATFORM := $(GOOS)-$(GOARCH)
 export GOOS
 export GOARCH
 
-# CGo (libsystemd/journald) is Linux-only; default it off everywhere except Linux.
-CGO_ENABLED ?= $(if $(filter linux,$(GOOS)),1,0)
+# Pure-Go build (no libsystemd/CGo): fully static binaries with no glibc floor,
+# so the same artifact runs across glibc versions (and musl). Keep CGo off.
+CGO_ENABLED ?= 0
 export CGO_ENABLED
 
 # Executable suffix and platform-scoped output tree. Artifacts land in the repo's
@@ -40,8 +41,8 @@ CMD := ./cmd
 # build.
 VERSION := $(shell cat internal/version/VERSION 2>/dev/null)
 
-# check-deps enforces libsystemd, which only exists on Linux — gate it by GOOS.
-DEPS := $(if $(filter linux,$(GOOS)),check-deps,)
+# No external C library deps: the build is pure Go (CGo disabled).
+DEPS :=
 
 # Per-platform module set. Linux ships all bundled modules; no module compiles
 # for Windows yet, so its set is empty until a Windows-capable module exists.
@@ -50,7 +51,7 @@ MODULES_windows :=
 MODULES := $(MODULES_$(GOOS))
 
 .PHONY: all _build suctl-bin suctl-modtest mod-nginx mod-certbot mod-os mod-fail2ban mod-odoo \
-        check-deps vet test test-py check clean clean-all help
+        vet test test-py check clean clean-all help
 
 ## all             clean target platform + build suctl + suctl-modtest + modules
 ##                 → bin/$(PLATFORM)/  (only the current platform tree is
@@ -122,11 +123,6 @@ mod-odoo:
 	cp sdk/python/suctlmod.py                      $(BIN)/modules/suctl-mod-odoo/
 	cp modules/suctl-mod-odoo/hooks/*.sh           $(BIN)/modules/suctl-mod-odoo/hooks/
 	cp modules/suctl-mod-odoo/hooks/*.py           $(BIN)/modules/suctl-mod-odoo/hooks/
-
-## check-deps      verify build-time C library dependencies (libsystemd-dev for CGo)
-check-deps:
-	@pkg-config --exists libsystemd 2>/dev/null || \
-		(printf '\nERROR: libsystemd-dev not found — required to compile sdjournal (CGo).\nInstall with: apt install libsystemd-dev\n\n' && exit 1)
 
 ## vet             run go vet
 vet:

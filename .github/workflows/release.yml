@@ -41,7 +41,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          # Linux builds use CGo (libsystemd/journald) → built natively per arch.
+          # Linux builds are pure Go (CGo off) → static, no glibc floor.
           - { goos: linux,   goarch: amd64, runner: ubuntu-latest }
           - { goos: linux,   goarch: arm64, runner: ubuntu-24.04-arm }
           # macOS/Windows are pure-Go (CGo off) → cross-built from an x64 runner.
@@ -56,11 +56,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Install build deps (Linux only — libsystemd for CGo/journald)
-        if: matrix.goos == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libsystemd-dev pkg-config
       - name: Vet & test (Go, native on linux/amd64)
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: make vet test

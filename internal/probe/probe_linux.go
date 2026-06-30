@@ -6,9 +6,9 @@ package probe
 
 import (
 	"context"
+	"os"
 
 	"github.com/coreos/go-systemd/v22/dbus"
-	"github.com/coreos/go-systemd/v22/sdjournal"
 )
 
 // runtimeWarnings probes the systemd runtime that suctl's svc and sys.log
@@ -24,11 +24,10 @@ func runtimeWarnings() []string {
 		conn.Close()
 	}
 
-	// Journal access — required by sys.log.* operations (journald source).
-	if j, err := sdjournal.NewJournal(); err != nil {
+	// Journal access — required by sys.log.* operations (journald source). Probe
+	// the journald socket directly to avoid a libsystemd/CGo dependency in core.
+	if _, err := os.Stat("/run/systemd/journal/socket"); err != nil {
 		warns = append(warns, "systemd journal unavailable — sys.log operations will fail: "+err.Error())
-	} else {
-		j.Close()
 	}
 
 	return warns
