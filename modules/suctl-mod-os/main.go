@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// suctl-mod-os is a suctl module that manages systemd services and
-// provides Linux OS diagnostic views (logs, resources, processes, network).
+// suctl-mod-os is a suctl module that manages systemd services on the host,
+// exposing the service surface (register / start / stop / restart).
 //
 // The module inherits one bidirectional broker wire from core via
 // SUCTL_BROKER_FD; modserver serves core's requests and makes its
@@ -31,26 +31,13 @@ func init() {
 
 func main() {
 	handlers := map[string]modserver.Handler{
-		"os.service.discover":   cmdServiceDiscover,
-		"os.service.list":       cmdServiceList,
 		"os.service.register":   cmdServiceRegister,
 		"os.service.unregister": cmdServiceUnregister,
-		"os.service.status":     cmdServiceStatus,
 		"os.service.start":      func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "start") },
 		"os.service.stop":       func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "stop") },
 		"os.service.restart":    func(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) { return cmdServiceControl(ctx, args, "restart") },
 		"os.service.survey":     cmdServiceSurvey,
 		"os.service.focus":      cmdServiceFocus,
-		"os.log.tail":           cmdLogTail,
-		"os.log.since":          cmdLogSince,
-		"os.log.search":         cmdLogSearch,
-		"os.log.level":          cmdLogLevel,
-		"os.resource.cpu":       cmdResourceCPU,
-		"os.resource.memory":    cmdResourceMemory,
-		"os.resource.disk":      cmdResourceDisk,
-		"os.process.top":        cmdProcessTop,
-		"os.network.ports":       cmdNetworkPorts,
-		"os.network.connections": cmdNetworkConnections,
 	}
 
 	if err := modserver.Serve(modserver.Config{

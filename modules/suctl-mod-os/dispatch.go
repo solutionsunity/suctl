@@ -22,78 +22,6 @@ func serviceArg(args map[string]interface{}) string {
 	return strings.TrimSpace(s)
 }
 
-// cmdServiceDiscover returns systemd state for all service units.
-func cmdServiceDiscover(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) {
-	conn, err := newConn()
-	if err != nil {
-		return failResult("CALLABLE_FAILED", err.Error())
-	}
-	defer conn.Close()
-	units, err := conn.ListUnits()
-	if err != nil {
-		return failResult("CALLABLE_FAILED", "list units: "+err.Error())
-	}
-	regs, _ := listRegistered()
-	regMap := make(map[string]*registration, len(regs))
-	for _, r := range regs {
-		regMap[r.name] = r
-	}
-	type discoverEntry struct {
-		Name        string   `json:"name"`
-		Load        string   `json:"load"`
-		Active      string   `json:"active"`
-		Sub         string   `json:"sub"`
-		Description string   `json:"description"`
-		Registered  bool     `json:"registered"`
-		Allowed     []string `json:"allowed,omitempty"`
-	}
-	var entries []discoverEntry
-	for _, u := range units {
-		if !strings.HasSuffix(u.Name, ".service") {
-			continue
-		}
-		name := strings.TrimSuffix(u.Name, ".service")
-		e := discoverEntry{Name: name, Load: u.LoadState, Active: u.ActiveState, Sub: u.SubState, Description: u.Description}
-		if r, ok := regMap[name]; ok {
-			e.Registered = true
-			e.Allowed = r.operations
-		}
-		entries = append(entries, e)
-	}
-	return okResult(entries)
-}
-
-func cmdServiceList(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) {
-	regs, err := listRegistered()
-	if err != nil {
-		return failResult("CALLABLE_FAILED", "read services.d: "+err.Error())
-	}
-	conn, err := newConn()
-	if err != nil {
-		return failResult("CALLABLE_FAILED", err.Error())
-	}
-	defer conn.Close()
-	units, _ := conn.ListUnits()
-	unitMap := make(map[string]string, len(units))
-	for _, u := range units {
-		unitMap[strings.TrimSuffix(u.Name, ".service")] = u.ActiveState
-	}
-	type entry struct {
-		Name    string   `json:"name"`
-		Active  string   `json:"active"`
-		Allowed []string `json:"allowed"`
-	}
-	result := make([]entry, 0, len(regs))
-	for _, r := range regs {
-		active := unitMap[r.name]
-		if active == "" {
-			active = "unknown"
-		}
-		result = append(result, entry{Name: r.name, Active: active, Allowed: r.operations})
-	}
-	return okResult(result)
-}
-
 func cmdServiceRegister(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) {
 	name := serviceArg(args)
 	if name == "" {
@@ -135,27 +63,6 @@ func cmdServiceUnregister(ctx context.Context, args map[string]interface{}) (int
 		return failResult("CALLABLE_FAILED", "remove registration: "+err.Error())
 	}
 	return okResult(map[string]interface{}{"name": name, "unregistered": true})
-}
-
-func cmdServiceStatus(ctx context.Context, args map[string]interface{}) (interface{}, *errorDetail) {
-	name := serviceArg(args)
-	if name == "" {
-		return failResult("INVALID_PARAMS", "name is required")
-	}
-	conn, err := newConn()
-	if err != nil {
-		return failResult("CALLABLE_FAILED", err.Error())
-	}
-	defer conn.Close()
-	props, err := conn.GetUnitProperties(name + ".service")
-	if err != nil {
-		return failResult("CALLABLE_FAILED", "get unit properties: "+err.Error())
-	}
-	str := func(key string) string { v, _ := props[key].(string); return v }
-	return okResult(map[string]interface{}{
-		"name": name, "load": str("LoadState"), "active": str("ActiveState"),
-		"sub": str("SubState"), "description": str("Description"), "unit_file": str("UnitFileState"),
-	})
 }
 
 var dbusSupportedOps = map[string]bool{"start": true, "stop": true, "restart": true, "reload": true, "enable": true, "disable": true}
